@@ -27,11 +27,20 @@ ARXIV_BASE = "https://export.arxiv.org/api/query"
 BIORXIV_BASE = "https://api.biorxiv.org/details"
 VERSION = "v10.0-universal"
 
-STOP = {
-    "the", "and", "for", "with", "from", "into", "about", "this", "that", "those", "these", "have", "has", "had", "were", "was", "are", "is", "be", "been", "being",
-    "study", "studies", "result", "results", "method", "methods", "data", "analysis", "analyses", "using", "use", "used", "based", "across", "between",
-    "also", "such", "their", "there", "within", "without", "under", "over", "via", "can", "could", "may", "might", "more", "most", "less", "least", "new",
+DEFAULT_STOP_RU = {
+    "и", "или", "что", "как", "при", "для", "это", "этот", "эта", "эти", "того", "также", "через", "между", "после", "перед", "если", "ли", "по", "на",
+    "из", "в", "к", "о", "об", "у", "над", "под", "без", "же", "бы", "мы", "вы", "они", "оно", "она", "данные", "анализ", "метод", "методы", "результат",
+    "результаты", "работа", "исследование", "исследования", "используя", "использование", "новый", "новые", "может", "могут", "более", "менее",
 }
+
+DEFAULT_STOP_EN = {
+    "the", "and", "or", "for", "with", "from", "into", "about", "this", "that", "those", "these", "have", "has", "had", "were", "was", "are", "is", "be", "been",
+    "being", "study", "studies", "result", "results", "method", "methods", "data", "analysis", "analyses", "using", "use", "used", "based", "across", "between",
+    "also", "such", "their", "there", "within", "without", "under", "over", "via", "can", "could", "may", "might", "more", "most", "less", "least", "new", "on",
+    "in", "at", "to", "by", "of", "a", "an", "as", "it", "its", "we", "our", "they", "them", "if", "than", "then",
+}
+
+STOP: Set[str] = set(DEFAULT_STOP_RU) | set(DEFAULT_STOP_EN)
 
 CSV_COLS = ["source", "openalex_id", "pmid", "arxiv_id", "doi", "title", "year", "publication_date", "type", "venue", "authors", "cited_by", "language",
             "primary_domain_id", "primary_field_id", "primary_topic", "topics", "concepts", "abstract", "oa_pdf_url", "best_url", "score"]
@@ -107,24 +116,54 @@ def get_secrets(root_dir: str) -> Dict[str, str]:
     return env
 
 
+def load_stopwords(root_dir: str) -> Set[str]:
+    stop: Set[str] = set(STOP)
+    for name in ["stopwords_ru.txt", "stopwords_en.txt"]:
+        path = os.path.join(root_dir, "config", name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    t = line.strip().lower()
+                    if t and not t.startswith("#"):
+                        stop.add(t)
+        except Exception:
+            pass
+    return stop
+
+
 def tokenize(text: str) -> List[str]:
-    return [t.lower() for t in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\-]{2,}", text or "")]
+    return [t.lower() for t in re.findall(r"[\w]+", text or "", flags=re.UNICODE) if re.search(r"[A-Za-zА-Яа-яЁё]", t)]
+
+
+def informative_token(token: str, stopwords: Set[str]) -> bool:
+    t = (token or "").strip().lower()
+    if len(t) < 3:
+        return False
+    if t in stopwords:
+        return False
+    if re.fullmatch(r"\d+", t):
+        return False
+    if not re.search(r"[A-Za-zА-Яа-яЁё]", t):
+        return False
+    return True
 
 
 def clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
-def rank_terms(text: str, max_terms: int = 120) -> List[str]:
-    freq = Counter(t for t in tokenize(text) if t not in STOP and not re.fullmatch(r"\d+", t))
+def rank_terms(text: str, stopwords: Set[str], max_terms: int = 120) -> List[str]:
+    freq = Counter(t for t in tokenize(text) if informative_token(t, stopwords))
     return [k for k, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:max_terms]]
 
 
-def make_ngrams(tokens: List[str], n: int) -> Counter:
+def make_ngrams(tokens: List[str], n: int, stopwords: Set[str]) -> Counter:
     c: Counter = Counter()
     for i in range(len(tokens) - n + 1):
         ng = tokens[i:i + n]
-        if any(t in STOP for t in ng):
+        if any(not informative_token(t, stopwords) for t in ng):
             continue
         c[" ".join(ng)] += 1
     return c
@@ -308,22 +347,59 @@ def row_from_ncbi(rec: Dict[str, Any], source: str) -> Dict[str, Any]:
     }
 
 
-def seed_queries(terms: List[str], limit: int = 10) -> List[str]:
-    q = []
-    for i in range(min(6, len(terms))):
-        block = terms[i:i + 3]
-        if len(block) >= 2:
-            q.append(" AND ".join(quote_term(x) for x in block[:3]))
-    if terms:
-        q.append(" OR ".join(quote_term(t) for t in terms[:5]))
-    uniq: List[str] = []
+def extract_phrases(text: str, stopwords: Set[str], max_phrases: int = 40) -> List[str]:
+    tokens = tokenize(text)
+    grams: Counter = Counter()
+    for n in (2, 3, 4):
+        grams.update(make_ngrams(tokens, n, stopwords))
+    phrases = [k for k, _ in grams.most_common(max_phrases) if len(k) >= 8]
+    return phrases
+
+
+def query_is_valid(query: str, stopwords: Set[str]) -> bool:
+    quoted = re.findall(r'"([^"]+)"', query or "")
+    if any(len(clean_spaces(q)) >= 8 for q in quoted):
+        return True
+    tokens = [t for t in tokenize(query) if informative_token(t, stopwords)]
+    return len(tokens) >= 2
+
+
+def seed_queries(terms: List[str], phrases: List[str], stopwords: Set[str], limit: int = 12) -> Tuple[List[str], Dict[str, Any]]:
+    candidates: List[str] = []
+    for ph in phrases[:8]:
+        candidates.append(f'"{clean_spaces(ph)}"')
+    for i in range(min(10, len(terms))):
+        a = terms[i]
+        b = terms[(i + 1) % len(terms)] if len(terms) > 1 else ""
+        if a and b and a != b:
+            candidates.append(f'{quote_term(a)} AND {quote_term(b)}')
+    for i in range(0, min(12, len(terms) - 2), 2):
+        trio = [terms[i], terms[i + 1], terms[i + 2]]
+        if len({*trio}) >= 2:
+            candidates.append(" AND ".join(quote_term(x) for x in trio))
+
+    kept: List[str] = []
     seen: Set[str] = set()
-    for x in q:
-        x = clean_spaces(x)
-        if x and x not in seen:
-            uniq.append(x)
-            seen.add(x)
-    return uniq[:limit]
+    dropped = 0
+    for raw in candidates:
+        q = clean_spaces(raw)
+        if not q or q in seen:
+            continue
+        seen.add(q)
+        if query_is_valid(q, stopwords):
+            kept.append(q)
+        else:
+            dropped += 1
+        if len(kept) >= limit:
+            break
+
+    stats = {
+        "generated": len(candidates),
+        "filtered_as_noise": dropped,
+        "accepted": len(kept),
+        "top5": kept[:5],
+    }
+    return kept, stats
 
 
 def ncbi_queries(terms: List[str], topn: int = 15) -> List[str]:
@@ -345,28 +421,28 @@ def ncbi_queries(terms: List[str], topn: int = 15) -> List[str]:
     return uniq[:topn]
 
 
-def row_tokens(r: Dict[str, Any]) -> Counter:
+def row_tokens(r: Dict[str, Any], stopwords: Set[str]) -> Counter:
     t = tokenize(" ".join([r.get("title", ""), r.get("abstract", ""), r.get("topics", ""), r.get("concepts", "")]))
-    return Counter([x for x in t if x not in STOP])
+    return Counter([x for x in t if informative_token(x, stopwords)])
 
 
-def build_profile(rows: List[Dict[str, Any]], top_n: int = 120) -> Tuple[Counter, Counter]:
+def build_profile(rows: List[Dict[str, Any]], stopwords: Set[str], top_n: int = 120) -> Tuple[Counter, Counter]:
     token_profile: Counter = Counter()
     topic_profile: Counter = Counter()
     for r in rows[:top_n]:
-        token_profile.update(row_tokens(r))
+        token_profile.update(row_tokens(r, stopwords))
         topic_profile.update(r.get("_topic_ids") or [])
     return token_profile, topic_profile
 
 
-def drift_score(row: Dict[str, Any], seed_tokens: Counter, seed_topics: Counter) -> float:
-    t_sim = cosine(row_tokens(row), seed_tokens)
+def drift_score(row: Dict[str, Any], seed_tokens: Counter, seed_topics: Counter, stopwords: Set[str]) -> float:
+    t_sim = cosine(row_tokens(row, stopwords), seed_tokens)
     top = Counter(row.get("_topic_ids") or [])
     topic_sim = cosine(top, seed_topics)
     return 0.75 * t_sim + 0.25 * topic_sim
 
 
-def mmr_select(rows: List[Dict[str, Any]], n: int, max_per_venue: int, max_per_topic: int, mmr_lambda: float) -> List[Dict[str, Any]]:
+def mmr_select(rows: List[Dict[str, Any]], n: int, max_per_venue: int, max_per_topic: int, mmr_lambda: float, stopwords: Set[str]) -> List[Dict[str, Any]]:
     selected: List[Dict[str, Any]] = []
     venue_count: Counter = Counter()
     topic_count: Counter = Counter()
@@ -383,9 +459,9 @@ def mmr_select(rows: List[Dict[str, Any]], n: int, max_per_venue: int, max_per_t
                 continue
             rel = float(r.get("score") or 0.0)
             sim = 0.0
-            rt = row_tokens(r)
+            rt = row_tokens(r, stopwords)
             for s in selected[-30:]:
-                sim = max(sim, cosine(rt, row_tokens(s)))
+                sim = max(sim, cosine(rt, row_tokens(s, stopwords)))
             mmr = mmr_lambda * rel - (1.0 - mmr_lambda) * sim
             if mmr > best_mmr:
                 best_mmr = mmr
@@ -451,6 +527,7 @@ def main() -> int:
     root_dir = os.path.abspath(os.path.join(idea_dir, "..", ".."))
     cfg = load_sources_config(root_dir)
     secrets = get_secrets(root_dir)
+    stopwords = load_stopwords(root_dir)
 
     log_path = os.path.join(out_dir, "module_B.log")
     search_log_path = os.path.join(out_dir, "search_log.json")
@@ -469,6 +546,7 @@ def main() -> int:
     dedup_seen: Set[str] = set()
     dedup_before = 0
     drift_filtered = 0
+    query_quality: Dict[str, Any] = {"generated": 0, "filtered_as_noise": 0, "accepted": 0, "top5": []}
 
     def add_row(r: Dict[str, Any]) -> bool:
         nonlocal dedup_before
@@ -487,9 +565,10 @@ def main() -> int:
             blob = input_blob(idea_dir)
             if not blob.strip():
                 raise RuntimeError("Нет входного текста идеи")
-            terms = rank_terms(blob, max_terms=120)
-            s_queries = seed_queries(terms, limit=12)
-            phases.append({"phase": "seed_query_build", "queries": s_queries[:8], "terms": terms[:20]})
+            terms = rank_terms(blob, stopwords, max_terms=120)
+            phrases = extract_phrases(blob, stopwords, max_phrases=40)
+            s_queries, query_quality = seed_queries(terms, phrases, stopwords, limit=12)
+            phases.append({"phase": "seed", "queries": s_queries[:8], "terms": terms[:20], "phrases": phrases[:8]})
 
             if cfg["enable"].get("openalex") and secrets.get("OPENALEX_API_KEY"):
                 oa = OAClient(api_key=secrets.get("OPENALEX_API_KEY", ""), mailto=secrets.get("OPENALEX_MAILTO", ""), rps=args.rps)
@@ -504,17 +583,17 @@ def main() -> int:
                     for w in oa.list_works(search=q, filter_parts=base, sort="relevance_score:desc", pages=1, select_fields=sel, log_fp=L):
                         if add_row(row_from_work(w, "openalex:seed")):
                             added += 1
-                    phases.append({"phase": "openalex_seed", "query": q, "added": added})
+                    phases.append({"phase": "topic/concept_map", "query": q, "added": added})
 
                 seed_sorted = sorted(rows_all, key=lambda r: int(r.get("cited_by") or 0), reverse=True)
-                token_profile, topic_profile = build_profile(seed_sorted, top_n=min(150, len(seed_sorted)))
+                token_profile, topic_profile = build_profile(seed_sorted, stopwords, top_n=min(150, len(seed_sorted)))
 
                 top_seed = seed_sorted[:max(30, min(cfg["relevance_feedback"]["top_n"], len(seed_sorted)))]
                 grams = Counter()
                 for r in top_seed:
-                    tks = [t for t in tokenize(" ".join([r.get("title", ""), r.get("abstract", "")])) if t not in STOP]
-                    grams.update(make_ngrams(tks, 2))
-                    grams.update(make_ngrams(tks, 3))
+                    tks = [t for t in tokenize(" ".join([r.get("title", ""), r.get("abstract", "")])) if informative_token(t, stopwords)]
+                    grams.update(make_ngrams(tks, 2, stopwords))
+                    grams.update(make_ngrams(tks, 3, stopwords))
                 rf_terms = [k for k, _ in grams.most_common(cfg["relevance_feedback"]["phrases"])]
                 rf_queries = [quote_term(x) for x in rf_terms[:cfg["relevance_feedback"]["queries"]]]
                 for q in rf_queries:
@@ -524,19 +603,21 @@ def main() -> int:
                     term_clean = q.replace('"', "")
                     for w in oa.list_works(search=None, filter_parts=base + [f"title.search:{term_clean}"], sort="cited_by_count:desc", pages=1, select_fields=sel, log_fp=L):
                         r = row_from_work(w, "openalex:feedback")
-                        d = drift_score(r, token_profile, topic_profile)
+                        d = drift_score(r, token_profile, topic_profile, stopwords)
                         r["_drift"] = d
                         if d < float(cfg["drift"]["threshold"]):
                             if len(rows_all) % max(1, int(1 / max(0.01, float(cfg["drift"]["explore_budget"])))) != 0:
                                 drift_filtered += 1
                                 continue
                         add_row(r)
-                phases.append({"phase": "relevance_feedback", "rf_queries": rf_queries[:8], "added_total": len(rows_all)})
+                phases.append({"phase": "harvest_filter", "rf_queries": rf_queries[:8], "added_total": len(rows_all)})
                 oa_requests = oa.request_count
             else:
                 oa_requests = 0
                 status = "DEGRADED"
                 errors.append("OpenAlex отключен или отсутствует OPENALEX_API_KEY")
+                phases.append({"phase": "topic/concept_map", "status": "skipped", "reason": "OpenAlex отключен"})
+                phases.append({"phase": "harvest_filter", "status": "skipped", "reason": "Нет seed-корпуса OpenAlex"})
 
             class NCBIClient(HttpClient):
                 def call(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -571,15 +652,19 @@ def main() -> int:
                                     added += 1
                                 else:
                                     dups += 1
-                        phases.append({"phase": "ncbi_query", "query": q, "found": len(ids), "added": added, "duplicates": dups})
+                        phases.append({"phase": "ncbi_search", "query": q, "found": len(ids), "added": added, "duplicates": dups})
                     ncbi_requests = nc.request_count
                 except Exception as e:
                     status = "DEGRADED"
                     errors.append(f"NCBI недоступен: {type(e).__name__}: {e}")
+                    phases.append({"phase": "ncbi_search", "status": "degraded", "reason": str(e)[:160]})
+            else:
+                phases.append({"phase": "ncbi_search", "status": "skipped", "reason": "NCBI отключен в config"})
 
             crossref_requests = 0
             if cfg["enable"].get("crossref") and secrets.get("CROSSREF_MAILTO"):
                 cr = HttpClient(rps=max(1.0, args.rps))
+                citation_events = 0
                 for r in rows_all[:1000]:
                     if r.get("doi"):
                         continue
@@ -600,16 +685,21 @@ def main() -> int:
                             r["doi"] = doi
                             r["_crossref_confidence"] = round(sim, 3)
                         elif doi:
-                            phases.append({"phase": "crossref_candidate", "title": title[:120], "doi": doi, "confidence": round(sim, 3)})
+                            phases.append({"phase": "citation_chase", "title": title[:120], "doi": doi, "confidence": round(sim, 3)})
+                            citation_events += 1
                     except Exception as e:
                         status = "DEGRADED"
                         errors.append(f"Crossref ошибка: {type(e).__name__}")
                         break
                 crossref_requests = cr.request_count
+                if citation_events == 0:
+                    phases.append({"phase": "citation_chase", "status": "ok", "matches": 0})
+            else:
+                phases.append({"phase": "citation_chase", "status": "skipped", "reason": "Crossref отключен или отсутствует CROSSREF_MAILTO"})
 
-            seed_tokens, seed_topics = build_profile(rows_all, top_n=160)
+            seed_tokens, seed_topics = build_profile(rows_all, stopwords, top_n=160)
             for r in rows_all:
-                drift = drift_score(r, seed_tokens, seed_topics)
+                drift = drift_score(r, seed_tokens, seed_topics, stopwords)
                 text = " ".join([r.get("title", ""), r.get("abstract", ""), r.get("topics", ""), r.get("concepts", "")]).lower()
                 lexical = sum(1 for t in terms[:40] if t in text)
                 rec = 1.0 if str(r.get("year") or "").isdigit() and int(r.get("year") or 0) >= 2019 else 0.0
@@ -619,7 +709,8 @@ def main() -> int:
             rows_ranked = sorted(rows_all, key=lambda x: (float(x.get("score") or 0.0), int(x.get("cited_by") or 0)), reverse=True)
             div = cfg["diversity"]
             final_n = args.n if args.scope != "focused" else min(300, max(200, args.n))
-            final_rows = mmr_select(rows_ranked, final_n, int(div["max_per_venue"]), int(div["max_per_topic"]), float(div["mmr_lambda"]))
+            final_rows = mmr_select(rows_ranked, final_n, int(div["max_per_venue"]), int(div["max_per_topic"]), float(div["mmr_lambda"]), stopwords)
+            phases.append({"phase": "final_select", "picked": len(final_rows), "from_ranked": len(rows_ranked)})
 
             unpaywall_requests = 0
             if cfg["enable"].get("unpaywall") and secrets.get("UNPAYWALL_EMAIL"):
@@ -669,7 +760,7 @@ def main() -> int:
                 "module": "B", "version": VERSION, "datetime_utc": utc_now(), "status": status,
                 "target_n": final_n, "requests": {"openalex": oa_requests, "ncbi": ncbi_requests, "crossref": crossref_requests, "unpaywall": unpaywall_requests},
                 "source_stats": dict(source_stats), "dedup": {"before": dedup_before, "after": len(dedup_seen)},
-                "seed_queries": s_queries, "errors": errors, "phases": phases,
+                "seed_queries": s_queries, "query_quality": query_quality, "errors": errors, "phases": phases,
             }
             with open(search_log_path, "w", encoding="utf-8") as f:
                 json.dump(search_log, f, ensure_ascii=False, indent=2)
@@ -717,7 +808,6 @@ def main() -> int:
                 "drift_filtered_pct": drift_filtered / max(1, dedup_before),
                 "errors": errors,
             })
-            print(summary, end="")
 
     return 0 if status in ("OK", "DEGRADED") else 1
 

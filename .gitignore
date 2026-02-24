@@ -1,3 +1,4 @@
-﻿.venv/
+.venv/
 __pycache__/
 ideas/**/out/
+config/secrets.env

@@ -1,9 +1,12 @@
+[Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+
 param(
   [ValidateSet("balanced","wide","focused")]
   [string]$Scope = "balanced",
   [string]$IdeaArg = "",
-  [int]$N = 300,
-  [switch]$NoPause
+  [int]$N = 300
 )
 
 $ErrorActionPreference = "Stop"
@@ -63,8 +66,14 @@ try {
   $outDir = Join-Path $IdeaDir "out"
   New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
+  Get-ChildItem -LiteralPath $outDir -Force -ErrorAction SilentlyContinue |
+    ForEach-Object {
+      Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
   Log ("[INFO] ROOT=" + $Root)
   Log ("[INFO] IDEA_DIR=" + $IdeaDir)
+  Log ("[INFO] Очищен out: " + $outDir)
   Log ("[INFO] SCOPE=" + $Scope)
   Log ("[INFO] N=" + $N)
   Log ("[INFO] LOG=" + $Log)
@@ -83,17 +92,17 @@ try {
 
   $summaryPath = Join-Path $outDir "stageB_summary.txt"
   if (Test-Path $summaryPath) {
-    Log "===== Сводка Stage B (из Python) ====="
+    Log "===== Сводка Stage B ====="
     Get-Content -LiteralPath $summaryPath | ForEach-Object { Log $_ }
   } else {
-    Log "[ERR] Не найден out\stageB_summary.txt"
+    Log ("[ERR] Не найден out\stageB_summary.txt. Проверьте лог: " + $Log)
     $code = 1
   }
-  if (-not $NoPause) { Read-Host "Нажмите Enter для завершения" | Out-Null }
+  Read-Host "Нажмите Enter..." | Out-Null
   exit $code
 }
 catch {
   Log ("[ERR] " + $_.Exception.Message)
-  if (-not $NoPause) { Read-Host "Нажмите Enter для завершения" | Out-Null }
+  Read-Host "Нажмите Enter..." | Out-Null
   exit 1
 }
