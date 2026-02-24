@@ -30,7 +30,7 @@ if not exist "%ROOT%tools\run_b_launcher.ps1" (
   exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\run_b_launcher.ps1" -Scope "!SCOPE!" -N 300
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\run_b_launcher.ps1" -Scope "!SCOPE!" -N 300 -NoPause
 set "RC=%ERRORLEVEL%"
 
 echo.
