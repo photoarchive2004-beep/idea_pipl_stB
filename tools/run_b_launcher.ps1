@@ -80,32 +80,13 @@ try {
   & $py $script --idea-dir $IdeaDir --n $N --scope $Scope
   $code = $LASTEXITCODE
 
-  $searchLog = Join-Path $outDir "search_log.json"
   $summaryPath = Join-Path $outDir "stageB_summary.txt"
-  if (Test-Path $searchLog) {
-    $j = Get-Content -LiteralPath $searchLog -Raw | ConvertFrom-Json
-    $st = if ($j.status) { $j.status } else { if ($code -eq 0) { "OK" } else { "FAILED" } }
-    $oa = 0; $nc = 0
-    if ($j.source_stats) {
-      if ($j.source_stats.openalex) { $oa = [int]$j.source_stats.openalex }
-      if ($j.source_stats.ncbi) { $nc = [int]$j.source_stats.ncbi }
-    }
-    $dedup = 0
-    if ($j.dedup_keys) { $dedup = [int]$j.dedup_keys }
-    $corpus = Join-Path $outDir "corpus.csv"
-    $lines = @(
-      "=== Краткая сводка Stage B ===",
-      "Статус: $st",
-      "Источник OpenAlex добавил: $oa",
-      "Источник NCBI добавил: $nc",
-      "Дедуп-ключей: $dedup",
-      "Корпус: $corpus"
-    )
-    $lines | Out-File -FilePath $summaryPath -Encoding UTF8
-    foreach($ln in $lines){ Log $ln }
+  if (Test-Path $summaryPath) {
+    Log "===== Сводка Stage B (из Python) ====="
+    Get-Content -LiteralPath $summaryPath | ForEach-Object { Log $_ }
   } else {
-    "=== Краткая сводка Stage B ===`nСтатус: FAILED`nsearch_log.json не найден" | Out-File -FilePath $summaryPath -Encoding UTF8
-    Log "[ERR] search_log.json не найден, сводка неполная"
+    Log "[ERR] Не найден out\stageB_summary.txt"
+    $code = 1
   }
   exit $code
 }
