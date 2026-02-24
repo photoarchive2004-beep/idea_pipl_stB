@@ -1,0 +1,36 @@
+{
+  "enable": {
+    "openalex": true,
+    "ncbi": true,
+    "crossref": true,
+    "unpaywall": true,
+    "europepmc": true,
+    "arxiv": true,
+    "biorxiv": true
+  },
+  "request_caps": {
+    "openalex": 160,
+    "ncbi": 80,
+    "crossref": 50,
+    "unpaywall": 250
+  },
+  "drift": {
+    "threshold": 0.22,
+    "explore_budget": 0.15
+  },
+  "diversity": {
+    "max_per_venue": 14,
+    "max_per_topic": 50,
+    "mmr_lambda": 0.72
+  },
+  "relevance_feedback": {
+    "top_n": 120,
+    "phrases": 30,
+    "queries": 10
+  },
+  "targets": {
+    "focused": [800, 1500],
+    "balanced": [1500, 3000],
+    "wide": [3000, 8000]
+  }
+}

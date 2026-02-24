@@ -1,42 +1,54 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Stage B — Literature Scout (OpenAlex + NCBI) — v9.0
-
-Strategy:
-1) SEED ("pearl growing"): boolean search over Works.search.
-2) Infer field: top primary_topic.domain + top topics.id from seed.
-3) EXPAND via filters (topics.id / primary_topic.domain.id) sorted by recency and citations.
-4) CITATION CHASING using filters:
-   - cites:W... (incoming citations)
-   - cited_by:W... (outgoing citations)
-5) Quality gates: min corpus size + anchor hit-rate.
-
-Outputs (idea_dir/out):
-- corpus.csv (DOI only)
-- corpus_all.csv (includes works without DOI)
-- search_log.json
-- field_map.md
-- prisma_lite.md
-- module_B.log
-- _moduleB_checkpoint.json
-"""
 from __future__ import annotations
-import argparse, csv, hashlib, json, os, re, sys, time, urllib.parse, urllib.request
+
+import argparse
+import csv
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import time
+import urllib.parse
+import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 BASE = "https://api.openalex.org"
 NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-VERSION = "v9.1-deep-harvest"
+CROSSREF_BASE = "https://api.crossref.org/works"
+UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
+EUROPEPMC_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+ARXIV_BASE = "https://export.arxiv.org/api/query"
+BIORXIV_BASE = "https://api.biorxiv.org/details"
+VERSION = "v10.0-universal"
+
+STOP = {
+    "the", "and", "for", "with", "from", "into", "about", "this", "that", "those", "these", "have", "has", "had", "were", "was", "are", "is", "be", "been", "being",
+    "study", "studies", "result", "results", "method", "methods", "data", "analysis", "analyses", "using", "use", "used", "based", "across", "between",
+    "also", "such", "their", "there", "within", "without", "under", "over", "via", "can", "could", "may", "might", "more", "most", "less", "least", "new",
+}
+
+CSV_COLS = ["source", "openalex_id", "pmid", "arxiv_id", "doi", "title", "year", "publication_date", "type", "venue", "authors", "cited_by", "language",
+            "primary_domain_id", "primary_field_id", "primary_topic", "topics", "concepts", "abstract", "oa_pdf_url", "best_url", "score"]
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def now_local() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def log(fp, msg: str) -> None:
-    fp.write(f"[{now_local()}] {msg}\n"); fp.flush()
+    fp.write(f"[{now_local()}] {msg}\n")
+    fp.flush()
+
 
 def read_text(path: str) -> str:
     try:
@@ -44,6 +56,7 @@ def read_text(path: str) -> str:
             return f.read()
     except Exception:
         return ""
+
 
 def read_env_file(path: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -58,410 +71,77 @@ def read_env_file(path: str) -> Dict[str, str]:
             out[k.strip()] = v.strip().strip('"').strip("'")
     return out
 
-def get_api_key(root_dir: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+
+def load_sources_config(root_dir: str) -> Dict[str, Any]:
+    defaults = {
+        "enable": {"openalex": True, "ncbi": True, "crossref": True, "unpaywall": True, "europepmc": True, "arxiv": True, "biorxiv": True},
+        "request_caps": {"openalex": 160, "ncbi": 80, "crossref": 50, "unpaywall": 250},
+        "drift": {"threshold": 0.22, "explore_budget": 0.15},
+        "diversity": {"max_per_venue": 14, "max_per_topic": 50, "mmr_lambda": 0.72},
+        "relevance_feedback": {"top_n": 120, "phrases": 30, "queries": 10},
+        "targets": {"focused": [800, 1500], "balanced": [1500, 3000], "wide": [3000, 8000]},
+    }
+    path = os.path.join(root_dir, "config", "stage_b_sources.json")
+    if not os.path.exists(path):
+        return defaults
+    try:
+        user = json.load(open(path, "r", encoding="utf-8"))
+    except Exception:
+        return defaults
+    def deep(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+        out = dict(dst)
+        for k, v in (src or {}).items():
+            if isinstance(v, dict) and isinstance(out.get(k), dict):
+                out[k] = deep(out[k], v)
+            else:
+                out[k] = v
+        return out
+    return deep(defaults, user)
+
+
+def get_secrets(root_dir: str) -> Dict[str, str]:
     env = read_env_file(os.path.join(root_dir, "config", "secrets.env"))
-    key = env.get("OPENALEX_API_KEY") or os.environ.get("OPENALEX_API_KEY")
-    mailto = env.get("OPENALEX_MAILTO") or os.environ.get("OPENALEX_MAILTO")
-    ncbi_key = env.get("NCBI_API_KEY") or os.environ.get("NCBI_API_KEY")
-    return key, mailto, ncbi_key
+    for k in ["OPENALEX_API_KEY", "OPENALEX_MAILTO", "NCBI_API_KEY", "NCBI_EMAIL", "CROSSREF_MAILTO", "UNPAYWALL_EMAIL"]:
+        if os.environ.get(k):
+            env[k] = os.environ[k]
+    return env
 
-def sha256(s: str) -> str:
-    return hashlib.sha256((s or "").encode("utf-8", errors="ignore")).hexdigest()
 
-def has_cyr(s: str) -> bool:
-    return bool(re.search(r"[А-Яа-яЁё]", s or ""))
+def tokenize(text: str) -> List[str]:
+    return [t.lower() for t in re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\-]{2,}", text or "")]
+
 
 def clean_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
-def oa_id_short(x: str) -> str:
-    if not x:
-        return ""
-    m = re.search(r"/(W\d+)$", x)
-    if m:
-        return m.group(1)
-    m = re.match(r"^(W\d+)$", x)
-    return m.group(1) if m else x
 
-def reconstruct_abstract(inv: Dict[str, List[int]]) -> str:
-    if not inv:
-        return ""
-    pos: Dict[int, str] = {}
-    for w, ps in inv.items():
-        for p in ps:
-            try:
-                pos[int(p)] = w
-            except Exception:
-                pass
-    if not pos:
-        return ""
-    return " ".join(pos[i] for i in sorted(pos.keys())).replace(" ,", ",").replace(" .", ".")
+def rank_terms(text: str, max_terms: int = 120) -> List[str]:
+    freq = Counter(t for t in tokenize(text) if t not in STOP and not re.fullmatch(r"\d+", t))
+    return [k for k, _ in sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))[:max_terms]]
 
-@dataclass
-class OAClient:
-    api_key: str
-    mailto: Optional[str] = None
-    rps: float = 2.0
-    timeout: int = 40
-    max_retries: int = 2
-    user_agent: str = "IdeaPipeline-StageB/v8.0"
-    request_count: int = 0
 
-    def _sleep(self) -> None:
-        if self.rps and self.rps > 0:
-            time.sleep(1.0 / float(self.rps))
-
-    def build_url(self, endpoint: str, params: Dict[str, Any]) -> str:
-        params = dict(params)
-        params["api_key"] = self.api_key
-        if self.mailto:
-            params["mailto"] = self.mailto
-        return BASE + endpoint + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
-
-    def get_json(self, url: str, log_fp=None) -> Dict[str, Any]:
-        last = None
-        for attempt in range(self.max_retries):
-            try:
-                self._sleep()
-                self.request_count += 1
-                req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    data = resp.read()
-                return json.loads(data.decode("utf-8"))
-            except urllib.error.HTTPError as e:
-                last = e
-                wait = min(40, 2 ** attempt)
-                if log_fp:
-                    log(log_fp, f"[WARN] HTTP {e.code} {e.reason}; retry {wait}s; url={url}")
-                time.sleep(wait)
-            except Exception as e:
-                last = e
-                wait = min(40, 2 ** attempt)
-                if log_fp:
-                    log(log_fp, f"[WARN] NET {type(e).__name__}: {e}; retry {wait}s; url={url}")
-                time.sleep(wait)
-        raise RuntimeError(f"HTTP failed after retries: {last}")
-
-    def list_works(self, *, search: Optional[str], filter_parts: List[str], sort: Optional[str],
-                   per_page: int, max_pages: int, select_fields: str, log_fp=None) -> Iterable[Dict[str, Any]]:
-        cursor = "*"
-        pages = 0
-        while cursor and pages < max_pages:
-            pages += 1
-            params: Dict[str, Any] = {"per-page": str(min(max(per_page, 1), 200)), "cursor": cursor}
-            if search:
-                params["search"] = search
-            if filter_parts:
-                params["filter"] = ",".join(filter_parts)
-            if sort:
-                params["sort"] = sort
-            if select_fields:
-                params["select"] = select_fields
-            url = self.build_url("/works", params)
-            j = self.get_json(url, log_fp=log_fp)
-            res = j.get("results") or []
-            cursor = (j.get("meta") or {}).get("next_cursor")
-            if not res:
-                break
-            for w in res:
-                yield w
-
-    def list_entities(self, endpoint: str, *, search: str, per_page: int = 50, max_pages: int = 1, log_fp=None) -> Iterable[Dict[str, Any]]:
-        cursor = "*"
-        pages = 0
-        while cursor and pages < max_pages:
-            pages += 1
-            params = {"search": search, "per-page": str(min(max(per_page, 1), 200)), "cursor": cursor}
-            url = self.build_url(endpoint, params)
-            j = self.get_json(url, log_fp=log_fp)
-            res = j.get("results") or []
-            cursor = (j.get("meta") or {}).get("next_cursor")
-            if not res:
-                break
-            for item in res:
-                yield item
-
-@dataclass
-class NCBIClient:
-    api_key: Optional[str] = None
-    mailto: Optional[str] = None
-    rps: float = 2.0
-    timeout: int = 40
-    max_retries: int = 2
-    request_count: int = 0
-
-    def _sleep(self) -> None:
-        if self.rps and self.rps > 0:
-            time.sleep(1.0 / float(self.rps))
-
-    def _call(self, endpoint: str, params: Dict[str, Any], log_fp=None) -> Dict[str, Any]:
-        p = dict(params)
-        p["retmode"] = "json"
-        if self.api_key:
-            p["api_key"] = self.api_key
-        if self.mailto:
-            p["email"] = self.mailto
-        url = NCBI_BASE + endpoint + "?" + urllib.parse.urlencode(p, quote_via=urllib.parse.quote)
-        last = None
-        for attempt in range(self.max_retries):
-            try:
-                self._sleep()
-                self.request_count += 1
-                req = urllib.request.Request(url, headers={"User-Agent": "IdeaPipeline-StageB/v9.0"})
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    data = resp.read()
-                return json.loads(data.decode("utf-8"))
-            except Exception as e:
-                last = e
-                wait = min(40, 2 ** attempt)
-                if log_fp:
-                    log(log_fp, f"[WARN] NCBI {type(e).__name__}: {e}; retry {wait}s")
-                time.sleep(wait)
-        raise RuntimeError(f"NCBI failed after retries: {last}")
-
-    def esearch(self, query: str, retmax: int = 60) -> List[str]:
-        j = self._call("/esearch.fcgi", {"db": "pubmed", "term": query, "retmax": str(retmax), "sort": "relevance"})
-        return (((j.get("esearchresult") or {}).get("idlist")) or [])
-
-    def esummary(self, pmids: List[str]) -> List[Dict[str, Any]]:
-        if not pmids:
-            return []
-        j = self._call("/esummary.fcgi", {"db": "pubmed", "id": ",".join(pmids)})
-        result = j.get("result") or {}
-        out = []
-        for pid in (result.get("uids") or []):
-            rec = result.get(pid) or {}
-            rec["_pmid"] = pid
-            out.append(rec)
-        return out
-
-RU2EN = {
-    "геномика":"genomics","геномный":"genomic","популяция":"population","популяционный":"population",
-    "адаптация":"adaptation","интрогрессия":"introgression","демография":"demography",
-    "связность":"connectivity","изоляция":"isolation","дистанция":"distance","сопротивление":"resistance",
-    "расселение":"range expansion","рефугиум":"refugium",
-}
-STOP = set("""the and for with from into about this that those these have has had were was are is be been being
-study studies result results method methods data analysis analyses using use used based across between
-""".split())
-GENERIC_METHOD = set("""bayesian framework frameworks model models algorithm algorithms machine learning deep learning neural network
-inference estimation pipeline approach approaches""".split())
-
-def tokenize(text: str) -> List[str]:
-    return re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\-]{2,}", text or "")
-
-def find_binomials(text: str, limit: int = 8) -> List[str]:
-    pat = re.compile(r"\b([A-Z][a-z]{2,})\s+([a-z]{3,})(?:\s+([a-z]{3,}))?\b")
-    out=[]
-    for m in pat.finditer(text or ""):
-        g,s,ss=m.group(1),m.group(2),m.group(3)
-        out.append(f"{g} {s}" + (f" {ss}" if ss else ""))
-        if len(out)>=limit:
-            break
-    seen=set(); u=[]
-    for x in out:
-        if x not in seen:
-            u.append(x); seen.add(x)
-    return u
-
-def norm_tok(t: str) -> str:
-    t = (t or "").strip().lower()
-    if not t or t in STOP:
-        return ""
-    if has_cyr(t):
-        t = RU2EN.get(t, "")
-        if not t:
-            return ""
-    t = clean_spaces(t)
-    if not t or t in STOP:
-        return ""
-    return t
-
-def rank_terms(text: str, max_terms: int = 50) -> List[str]:
-    freq: Dict[str, int] = {}
-    for tok in tokenize(text):
-        nt = norm_tok(tok)
-        if not nt:
+def make_ngrams(tokens: List[str], n: int) -> Counter:
+    c: Counter = Counter()
+    for i in range(len(tokens) - n + 1):
+        ng = tokens[i:i + n]
+        if any(t in STOP for t in ng):
             continue
-        if re.fullmatch(r"\d+", nt):
-            continue
-        freq[nt] = freq.get(nt, 0) + 1
-    ranked = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
-    return [k for k,_ in ranked[:max_terms]]
-
-def quote_term(t: str) -> str:
-    t = clean_spaces(t)
-    if " " in t or "-" in t:
-        return f"\"{t}\""
-    return t
-
-def split_domain_method(terms: List[str], binom: List[str]) -> Tuple[List[str], List[str]]:
-    domain=[]; method=[]
-    for x in terms:
-        if x in GENERIC_METHOD:
-            method.append(x)
-        else:
-            domain.append(x)
-    for b in binom[:3]:
-        if b.lower() not in [d.lower() for d in domain]:
-            domain.insert(0, b)
-    def uniq(xs):
-        out=[]; seen=set()
-        for z in xs:
-            z = clean_spaces(z)
-            if not z:
-                continue
-            k=z.lower()
-            if k in seen:
-                continue
-            out.append(z); seen.add(k)
-        return out
-    return uniq(domain)[:10], uniq(method)[:12]
-
-def build_seed_queries(domain: List[str], method: List[str]) -> List[str]:
-    method2=[m for m in method if m.lower() not in GENERIC_METHOD]
-    if not domain:
-        domain = ["research"]
-    dom_q = [quote_term(d) for d in domain[:6]]
-    if len(dom_q) >= 2:
-        dom_group = "(" + " OR ".join(dom_q[:4]) + ")"
-    else:
-        dom_group = dom_q[0]
-    safe_methods = [quote_term(m) for m in method2[:8]]
-    safe_methods += ["systematic review", "meta analysis", "benchmark", "evaluation", "longitudinal study"]
-    seen=set(); mp=[]
-    for x in safe_methods:
-        k=x.lower()
-        if k in seen:
-            continue
-        mp.append(x); seen.add(k)
-        if len(mp) >= 10:
-            break
-    met_group = "(" + " OR ".join(mp) + ")"
-    q1 = f"{dom_group} AND {met_group}"
-    q2 = f"{dom_group} AND (review OR \"meta-analysis\" OR overview)"
-    qs=[q1,q2]
-    for b in dom_q[:3]:
-        if b.startswith("\"") and b.endswith("\""):
-            qs.append(f"{b} AND (genomics OR phylogeography OR population)")
-    out=[]; s=set()
-    for q in qs:
-        q = clean_spaces(q)
-        if q and q not in s:
-            out.append(q); s.add(q)
-    return out[:12]
-
-CSV_COLS = ["source","openalex_id","pmid","arxiv_id","doi","title","year","publication_date","type","venue","authors","cited_by","language",
-            "primary_domain_id","primary_field_id","primary_topic","topics","concepts","abstract"]
-
-def extract_authors(w: Dict[str,Any], n: int = 25) -> str:
-    names=[]
-    for a in (w.get("authorships") or [])[:n]:
-        dn = ((a or {}).get("author") or {}).get("display_name")
-        if dn:
-            names.append(dn)
-    return "; ".join(names)
-
-def extract_venue(w: Dict[str,Any]) -> str:
-    pl = w.get("primary_location") or {}
-    src = pl.get("source") or {}
-    return (src.get("display_name") or "")
-
-def extract_topics(w: Dict[str,Any], k: int = 8) -> Tuple[List[str], List[str]]:
-    ids=[]; names=[]
-    for t in (w.get("topics") or [])[:k]:
-        tid = (t or {}).get("id") or ""
-        nm  = (t or {}).get("display_name") or ""
-        if tid:
-            ids.append(tid.replace("https://openalex.org/",""))
-        if nm:
-            names.append(nm)
-    return ids, names
-
-def extract_concepts(w: Dict[str,Any], k: int = 12) -> Tuple[List[str], List[str]]:
-    cs = w.get("concepts") or []
-    try:
-        cs = sorted(cs, key=lambda c: (c or {}).get("score",0), reverse=True)
-    except Exception:
-        pass
-    ids=[]; names=[]
-    for c in cs[:k]:
-        cid = (c or {}).get("id") or ""
-        nm  = (c or {}).get("display_name") or ""
-        if cid:
-            ids.append(cid.replace("https://openalex.org/",""))
-        if nm:
-            names.append(nm)
-    return ids, names
-
-def row_from_work(w: Dict[str,Any], source: str) -> Dict[str,Any]:
-    oid = oa_id_short(w.get("id","") or w.get("openalex_id",""))
-    doi = (w.get("doi") or "").replace("https://doi.org/","").strip()
-    title = (w.get("title") or w.get("display_name") or "").strip()
-    year = w.get("publication_year") or ""
-    pdate = w.get("publication_date") or ""
-    wtype = w.get("type") or ""
-    cited = int(w.get("cited_by_count") or 0)
-    lang = (w.get("language") or "").lower()
-    pt = w.get("primary_topic") or {}
-    pt_name = pt.get("display_name") or ""
-    dom_id = ((pt.get("domain") or {}).get("id") or "").replace("https://openalex.org/","")
-    fld_id = ((pt.get("field") or {}).get("id") or "").replace("https://openalex.org/","")
-    t_ids, t_names = extract_topics(w, k=8)
-    c_ids, c_names = extract_concepts(w, k=12)
-    abstr = reconstruct_abstract(w.get("abstract_inverted_index") or {})
-    return {
-        "source":source,"openalex_id":oid,"pmid":"","arxiv_id":"","doi":doi,"title":title,"year":year,"publication_date":pdate,"type":wtype,
-        "venue":extract_venue(w),"authors":extract_authors(w),"cited_by":cited,"language":lang,
-        "primary_domain_id":dom_id,"primary_field_id":fld_id,"primary_topic":pt_name,
-        "topics":"; ".join(t_names),"concepts":"; ".join(c_names),"abstract":abstr,
-        "_topic_ids":t_ids
-    }
+        c[" ".join(ng)] += 1
+    return c
 
 
-def row_from_ncbi(rec: Dict[str,Any], source: str) -> Dict[str,Any]:
-    article_ids = rec.get("articleids") or []
-    doi = ""
-    arxiv = ""
-    for a in article_ids:
-        if (a or {}).get("idtype") == "doi":
-            doi = (a or {}).get("value") or ""
-        if (a or {}).get("idtype") == "arxiv":
-            arxiv = (a or {}).get("value") or ""
-    authors = "; ".join([(x or {}).get("name") or "" for x in (rec.get("authors") or []) if (x or {}).get("name")])
-    pubdate = rec.get("pubdate") or ""
-    year = ""
-    m = re.search(r"(19|20)\d{2}", str(pubdate))
-    if m:
-        year = m.group(0)
-    return {
-        "source": source,
-        "openalex_id": "",
-        "pmid": str(rec.get("_pmid") or ""),
-        "arxiv_id": arxiv,
-        "doi": doi.strip(),
-        "title": (rec.get("title") or "").strip(),
-        "year": year,
-        "publication_date": pubdate,
-        "type": rec.get("pubtype") or "article",
-        "venue": rec.get("fulljournalname") or rec.get("source") or "",
-        "authors": authors,
-        "cited_by": 0,
-        "language": "",
-        "primary_domain_id": "",
-        "primary_field_id": "",
-        "primary_topic": "",
-        "topics": "",
-        "concepts": "",
-        "abstract": "",
-        "_topic_ids": []
-    }
+def quote_term(term: str) -> str:
+    t = clean_spaces(term)
+    return f'"{t}"' if " " in t else t
+
 
 def _normalize_title(t: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (t or "").lower())
 
+
 def first_author(authors: str) -> str:
     return clean_spaces((authors or "").split(";")[0]).lower()
+
 
 def dedup_key(row: Dict[str, Any]) -> str:
     if row.get("doi"):
@@ -474,24 +154,20 @@ def dedup_key(row: Dict[str, Any]) -> str:
         return "arxiv:" + row.get("arxiv_id", "")
     return f"title:{_normalize_title(row.get('title',''))}|year:{row.get('year','')}|fa:{first_author(row.get('authors',''))}"
 
-def save_csv(path: str, rows: List[Dict[str,Any]]) -> None:
-    with open(path,"w",newline="",encoding="utf-8") as f:
+
+def input_blob(idea_dir: str) -> str:
+    out_dir = os.path.join(idea_dir, "out")
+    parts = [read_text(os.path.join(out_dir, "structured_idea.json")), read_text(os.path.join(idea_dir, "idea.txt")), read_text(os.path.join(idea_dir, "in", "idea.txt"))]
+    return "\n".join([x for x in parts if x and x.strip()])
+
+
+def save_csv(path: str, rows: List[Dict[str, Any]]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_COLS)
         w.writeheader()
         for r in rows:
-            w.writerow({k:r.get(k,"") for k in CSV_COLS})
+            w.writerow({k: r.get(k, "") for k in CSV_COLS})
 
-def build_anchor_set(domain_terms: List[str], method_terms: List[str]) -> Set[str]:
-    a=set()
-    for x in domain_terms[:10]:
-        a.add(x.lower())
-    for x in method_terms[:12]:
-        if x.lower() in GENERIC_METHOD:
-            continue
-        a.add(x.lower())
-    for x in ["systematic review", "meta analysis", "benchmark", "evidence", "dataset", "experimental"]:
-        a.add(x.lower())
-    return a
 
 def count_csv_rows(path: str) -> int:
     if not os.path.exists(path):
@@ -499,434 +175,552 @@ def count_csv_rows(path: str) -> int:
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         return max(0, sum(1 for _ in f) - 1)
 
-def write_stage_summary(path: str, *, status: str, started_utc: str, source_stats: Dict[str, int],
-                        dedup_total: int, corpus_path: str, corpus_all_path: str,
-                        errors: List[str], search_log_path: str, module_log_path: str,
-                        checkpoint_path: str, requests: Dict[str, int]) -> str:
+
+def cosine(a: Counter, b: Counter) -> float:
+    if not a or not b:
+        return 0.0
+    dots = sum(v * b.get(k, 0) for k, v in a.items())
+    na = math.sqrt(sum(v * v for v in a.values()))
+    nb = math.sqrt(sum(v * v for v in b.values()))
+    return dots / (na * nb) if na > 0 and nb > 0 else 0.0
+
+
+@dataclass
+class HttpClient:
+    timeout: int = 35
+    rps: float = 2.0
+    max_retries: int = 2
+    request_count: int = 0
+
+    def get_json(self, url: str, headers: Optional[Dict[str, str]] = None, log_fp=None) -> Dict[str, Any]:
+        last = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                if self.rps > 0:
+                    time.sleep(1.0 / self.rps)
+                self.request_count += 1
+                req = urllib.request.Request(url, headers=headers or {})
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8", errors="replace"))
+            except Exception as e:
+                last = e
+                if log_fp:
+                    log(log_fp, f"[WARN] HTTP ошибка {type(e).__name__}: {e}")
+                time.sleep(min(30, 2 ** attempt))
+        raise RuntimeError(str(last))
+
+
+class OAClient(HttpClient):
+    def __init__(self, api_key: str, mailto: str, **kw: Any):
+        super().__init__(**kw)
+        self.api_key = api_key
+        self.mailto = mailto
+
+    def build(self, params: Dict[str, Any]) -> str:
+        p = dict(params)
+        p["api_key"] = self.api_key
+        if self.mailto:
+            p["mailto"] = self.mailto
+        return BASE + "/works?" + urllib.parse.urlencode(p, quote_via=urllib.parse.quote)
+
+    def list_works(self, *, search: Optional[str], filter_parts: List[str], sort: str, pages: int, select_fields: str, per_page: int = 200, log_fp=None) -> Iterable[Dict[str, Any]]:
+        cursor = "*"
+        for _ in range(max(1, pages)):
+            params: Dict[str, Any] = {"per-page": str(min(200, max(1, per_page))), "cursor": cursor, "sort": sort, "select": select_fields}
+            if search:
+                params["search"] = search
+            if filter_parts:
+                params["filter"] = ",".join(filter_parts)
+            j = self.get_json(self.build(params), headers={"User-Agent": "IdeaPipeline-StageB/v10"}, log_fp=log_fp)
+            res = j.get("results") or []
+            if not res:
+                break
+            for w in res:
+                yield w
+            cursor = (j.get("meta") or {}).get("next_cursor")
+            if not cursor:
+                break
+
+
+def oa_id_short(x: str) -> str:
+    m = re.search(r"/(W\d+)$", x or "")
+    return m.group(1) if m else (x or "")
+
+
+def reconstruct_abstract(inv: Dict[str, List[int]]) -> str:
+    pos: Dict[int, str] = {}
+    for w, ps in (inv or {}).items():
+        for p in ps:
+            try:
+                pos[int(p)] = w
+            except Exception:
+                pass
+    return " ".join(pos[i] for i in sorted(pos.keys()))
+
+
+def row_from_work(w: Dict[str, Any], source: str) -> Dict[str, Any]:
+    topics = [(t.get("id") or "").replace("https://openalex.org/", "") for t in (w.get("topics") or [])]
+    return {
+        "source": source,
+        "openalex_id": oa_id_short(w.get("id", "")),
+        "pmid": "",
+        "arxiv_id": "",
+        "doi": (w.get("doi") or "").replace("https://doi.org/", ""),
+        "title": (w.get("title") or w.get("display_name") or "").strip(),
+        "year": str(w.get("publication_year") or ""),
+        "publication_date": w.get("publication_date") or "",
+        "type": w.get("type") or "",
+        "venue": (((w.get("primary_location") or {}).get("source") or {}).get("display_name") or ""),
+        "authors": "; ".join([((a.get("author") or {}).get("display_name") or "") for a in (w.get("authorships") or []) if ((a.get("author") or {}).get("display_name"))]),
+        "cited_by": int(w.get("cited_by_count") or 0),
+        "language": (w.get("language") or ""),
+        "primary_domain_id": ((((w.get("primary_topic") or {}).get("domain") or {}).get("id") or "").replace("https://openalex.org/", "")),
+        "primary_field_id": ((((w.get("primary_topic") or {}).get("field") or {}).get("id") or "").replace("https://openalex.org/", "")),
+        "primary_topic": ((w.get("primary_topic") or {}).get("display_name") or ""),
+        "topics": "; ".join([(t.get("display_name") or "") for t in (w.get("topics") or [])[:8]]),
+        "concepts": "; ".join([(c.get("display_name") or "") for c in (w.get("concepts") or [])[:10]]),
+        "abstract": reconstruct_abstract(w.get("abstract_inverted_index") or {}),
+        "oa_pdf_url": "",
+        "best_url": "",
+        "score": 0.0,
+        "_topic_ids": [x for x in topics if x],
+    }
+
+
+def row_from_ncbi(rec: Dict[str, Any], source: str) -> Dict[str, Any]:
+    article_ids = rec.get("articleids") or []
+    doi = ""
+    arxiv = ""
+    for a in article_ids:
+        if (a or {}).get("idtype") == "doi":
+            doi = (a or {}).get("value") or ""
+        if (a or {}).get("idtype") == "arxiv":
+            arxiv = (a or {}).get("value") or ""
+    authors = "; ".join([(x or {}).get("name") or "" for x in (rec.get("authors") or []) if (x or {}).get("name")])
+    pubdate = rec.get("pubdate") or ""
+    y = re.search(r"(19|20)\d{2}", str(pubdate))
+    return {
+        "source": source, "openalex_id": "", "pmid": str(rec.get("_pmid") or ""), "arxiv_id": arxiv, "doi": doi,
+        "title": (rec.get("title") or "").strip(), "year": y.group(0) if y else "", "publication_date": pubdate,
+        "type": rec.get("pubtype") or "article", "venue": rec.get("fulljournalname") or rec.get("source") or "",
+        "authors": authors, "cited_by": 0, "language": "", "primary_domain_id": "", "primary_field_id": "", "primary_topic": "",
+        "topics": "", "concepts": "", "abstract": "", "oa_pdf_url": "", "best_url": "", "score": 0.0, "_topic_ids": []
+    }
+
+
+def seed_queries(terms: List[str], limit: int = 10) -> List[str]:
+    q = []
+    for i in range(min(6, len(terms))):
+        block = terms[i:i + 3]
+        if len(block) >= 2:
+            q.append(" AND ".join(quote_term(x) for x in block[:3]))
+    if terms:
+        q.append(" OR ".join(quote_term(t) for t in terms[:5]))
+    uniq: List[str] = []
+    seen: Set[str] = set()
+    for x in q:
+        x = clean_spaces(x)
+        if x and x not in seen:
+            uniq.append(x)
+            seen.add(x)
+    return uniq[:limit]
+
+
+def ncbi_queries(terms: List[str], topn: int = 15) -> List[str]:
+    blocks = [terms[0:6], terms[6:12], terms[12:18]]
+    blocks = [b for b in blocks if b]
+    out: List[str] = []
+    if len(blocks) >= 3:
+        for i in range(min(6, len(blocks[0]))):
+            q = f"({blocks[0][i]}[tiab]) AND ({blocks[1][i % len(blocks[1])]}[tiab]) AND ({blocks[2][i % len(blocks[2])]}[tiab])"
+            out.append(q)
+    for i in range(min(6, len(terms))):
+        out.append(f"({terms[i]}[tiab]) AND ({terms[(i + 1) % len(terms)]}[tiab])")
+    uniq = []
+    seen = set()
+    for q in out:
+        if q not in seen:
+            uniq.append(q)
+            seen.add(q)
+    return uniq[:topn]
+
+
+def row_tokens(r: Dict[str, Any]) -> Counter:
+    t = tokenize(" ".join([r.get("title", ""), r.get("abstract", ""), r.get("topics", ""), r.get("concepts", "")]))
+    return Counter([x for x in t if x not in STOP])
+
+
+def build_profile(rows: List[Dict[str, Any]], top_n: int = 120) -> Tuple[Counter, Counter]:
+    token_profile: Counter = Counter()
+    topic_profile: Counter = Counter()
+    for r in rows[:top_n]:
+        token_profile.update(row_tokens(r))
+        topic_profile.update(r.get("_topic_ids") or [])
+    return token_profile, topic_profile
+
+
+def drift_score(row: Dict[str, Any], seed_tokens: Counter, seed_topics: Counter) -> float:
+    t_sim = cosine(row_tokens(row), seed_tokens)
+    top = Counter(row.get("_topic_ids") or [])
+    topic_sim = cosine(top, seed_topics)
+    return 0.75 * t_sim + 0.25 * topic_sim
+
+
+def mmr_select(rows: List[Dict[str, Any]], n: int, max_per_venue: int, max_per_topic: int, mmr_lambda: float) -> List[Dict[str, Any]]:
+    selected: List[Dict[str, Any]] = []
+    venue_count: Counter = Counter()
+    topic_count: Counter = Counter()
+    pool = list(rows)
+    while pool and len(selected) < n:
+        best = None
+        best_mmr = -10**9
+        for r in pool[:800]:
+            venue = (r.get("venue") or "").lower()
+            if venue and venue_count[venue] >= max_per_venue:
+                continue
+            tps = r.get("_topic_ids") or []
+            if tps and max(topic_count[x] for x in tps) >= max_per_topic:
+                continue
+            rel = float(r.get("score") or 0.0)
+            sim = 0.0
+            rt = row_tokens(r)
+            for s in selected[-30:]:
+                sim = max(sim, cosine(rt, row_tokens(s)))
+            mmr = mmr_lambda * rel - (1.0 - mmr_lambda) * sim
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best = r
+        if not best:
+            break
+        selected.append(best)
+        venue = (best.get("venue") or "").lower()
+        if venue:
+            venue_count[venue] += 1
+        for x in (best.get("_topic_ids") or []):
+            topic_count[x] += 1
+        pool.remove(best)
+    if len(selected) < n:
+        for r in pool:
+            if len(selected) >= n:
+                break
+            selected.append(r)
+    return selected
+
+
+def write_stage_summary(path: str, data: Dict[str, Any]) -> str:
     lines = [
         "=== Сводка Stage B ===",
-        f"Статус: {status}",
-        f"Время (UTC): старт {started_utc}",
-        f"Добавлено OpenAlex: {int(source_stats.get('openalex', 0))}",
-        f"Добавлено NCBI: {int(source_stats.get('ncbi', 0))}",
-        f"Дедуп (уникальных ключей): {dedup_total}",
-        f"Итог corpus.csv: {count_csv_rows(corpus_path)} записей",
-        f"Итог corpus_all.csv: {count_csv_rows(corpus_all_path)} записей",
-        f"Запросов OpenAlex: {int(requests.get('openalex', 0))}",
-        f"Запросов NCBI: {int(requests.get('ncbi', 0))}",
-        f"Файл корпуса: {corpus_path}",
-        f"Файл полного корпуса: {corpus_all_path}",
-        f"Лог поиска: {search_log_path}",
-        f"Лог модуля: {module_log_path}",
-        f"Чекпоинт: {checkpoint_path}",
+        f"Статус: {data['status']}",
+        f"Старт UTC: {data['started_utc']}",
+        f"Длительность (сек): {data['elapsed_sec']}",
+        f"Запросов OpenAlex: {data['requests'].get('openalex', 0)}",
+        f"Запросов NCBI: {data['requests'].get('ncbi', 0)}",
+        f"Запросов Crossref: {data['requests'].get('crossref', 0)}",
+        f"Запросов Unpaywall: {data['requests'].get('unpaywall', 0)}",
+        f"Добавлено по источникам: {json.dumps(data['source_stats'], ensure_ascii=False)}",
+        f"Дедуп: до={data['dedup_before']} после={data['dedup_after']}",
+        f"corpus_all: {data['corpus_all']} | corpus: {data['corpus']}",
+        f"Покрытие DOI: {data['doi_coverage']:.1%}",
+        f"OA rate: {data['oa_rate']:.1%}",
+        f"Диверсификация: venue={data['unique_venues']} topic={data['unique_topics']}",
+        f"Drift отфильтровано: {data['drift_filtered_pct']:.1%}",
+        f"Причины: {' | '.join(data['errors'][:3]) if data['errors'] else 'нет'}",
     ]
-    if errors:
-        lines.append("Причины деградации/ошибки: " + " | ".join(errors[:3]))
     text = "\n".join(lines[:20]) + "\n"
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return text
 
-def score_row(r: Dict[str,Any], anchors: Set[str]) -> int:
-    text = " ".join([r.get("title",""), r.get("abstract",""), r.get("topics",""), r.get("concepts","")]).lower()
-    hits=0
-    for a in anchors:
-        if a and a in text:
-            hits += 1
-    t = (r.get("title","") or "").lower()
-    for a in anchors:
-        if a and a in t:
-            hits += 2
-    return hits
-
-def top_domain(rows: List[Dict[str,Any]]) -> Tuple[str,float,Dict[str,int]]:
-    cnt={}
-    for r in rows:
-        d = (r.get("primary_domain_id") or "").strip()
-        if not d:
-            continue
-        cnt[d]=cnt.get(d,0)+1
-    if not cnt:
-        return ("",0.0,cnt)
-    total=sum(cnt.values())
-    best=max(cnt.items(), key=lambda kv: kv[1])
-    return (best[0], best[1]/max(total,1), cnt)
-
-def top_topic_ids(rows: List[Dict[str,Any]], topk: int = 12) -> List[str]:
-    cnt={}
-    for r in rows:
-        for tid in r.get("_topic_ids", []) or []:
-            if not tid:
-                continue
-            cnt[tid]=cnt.get(tid,0)+1
-    return [k for k,_ in sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0]))[:topk]]
-
-def input_blob(idea_dir: str) -> str:
-    out_dir=os.path.join(idea_dir,"out")
-    parts=[
-        read_text(os.path.join(out_dir,"structured_idea.json")),
-        read_text(os.path.join(idea_dir,"idea.txt")),
-        read_text(os.path.join(idea_dir,"in","idea.txt")),
-    ]
-    return "\n".join([p for p in parts if p and p.strip()])
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--idea-dir", required=True)
     ap.add_argument("--n", type=int, default=300)
-    ap.add_argument("--scope", choices=["balanced","wide","focused"], default="balanced")
+    ap.add_argument("--scope", choices=["balanced", "wide", "focused"], default="balanced")
     ap.add_argument("--from-year", type=int, default=1990)
     ap.add_argument("--to-year", type=int, default=2100)
     ap.add_argument("--rps", type=float, default=2.0)
     ap.add_argument("--request-cap", type=int, default=220)
-    ap.add_argument("--fresh", action="store_true")
-    ap.add_argument("--min-keep", type=int, default=80)
-    ap.add_argument("--min-anchor-hit", type=float, default=0.20)
     args = ap.parse_args()
 
+    started_ts = time.time()
+    started_utc = utc_now()
     idea_dir = os.path.abspath(args.idea_dir)
     out_dir = os.path.join(idea_dir, "out")
     os.makedirs(out_dir, exist_ok=True)
-
-    started_utc = utc_now()
-    status = "OK"
-    errors: List[str] = []
-    phases: List[Dict[str, Any]] = []
-    source_stats = {"openalex": 0, "ncbi": 0}
-    rows_all: List[Dict[str, Any]] = []
-    dedup_seen: Set[str] = set()
-    oa_requests = 0
-    ncbi_requests = 0
-    seed_queries: List[str] = []
-    domain_terms: List[str] = []
-    method_terms: List[str] = []
-    tgate: List[str] = []
-    cgate: List[str] = []
-    dom_gate = ""
-    dom_share = 0.0
-    dom_cnt: Dict[str, int] = {}
+    root_dir = os.path.abspath(os.path.join(idea_dir, "..", ".."))
+    cfg = load_sources_config(root_dir)
+    secrets = get_secrets(root_dir)
 
     log_path = os.path.join(out_dir, "module_B.log")
-    root_dir = os.path.abspath(os.path.join(idea_dir, "..", ".."))
-    api_key, mailto, ncbi_key = get_api_key(root_dir)
     search_log_path = os.path.join(out_dir, "search_log.json")
     summary_path = os.path.join(out_dir, "stageB_summary.txt")
     corpus_path = os.path.join(out_dir, "corpus.csv")
     corpus_all_path = os.path.join(out_dir, "corpus_all.csv")
     ckpt_path = os.path.join(out_dir, "_moduleB_checkpoint.json")
+    field_map_path = os.path.join(out_dir, "field_map.md")
+    prisma_path = os.path.join(out_dir, "prisma_lite.md")
+
+    status = "OK"
+    errors: List[str] = []
+    phases: List[Dict[str, Any]] = []
+    source_stats: Dict[str, int] = Counter()
+    rows_all: List[Dict[str, Any]] = []
+    dedup_seen: Set[str] = set()
+    dedup_before = 0
+    drift_filtered = 0
 
     def add_row(r: Dict[str, Any]) -> bool:
+        nonlocal dedup_before
+        dedup_before += 1
         k = dedup_key(r)
         if k in dedup_seen:
             return False
         dedup_seen.add(k)
         rows_all.append(r)
-        src = "ncbi" if "ncbi" in str(r.get("source", "")).lower() else "openalex"
-        source_stats[src] = source_stats.get(src, 0) + 1
+        src = (r.get("source") or "unknown").split(":")[0]
+        source_stats[src] += 1
         return True
 
-    def strip(rs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        out = []
-        for r in rs:
-            rr = dict(r)
-            rr.pop("_score", None)
-            rr.pop("_topic_ids", None)
-            out.append(rr)
-        return out
-
     with open(log_path, "a", encoding="utf-8") as L:
-        log(L, f"Stage B {VERSION} старт UTC={started_utc} scope={args.scope} target={args.n}")
         try:
             blob = input_blob(idea_dir)
             if not blob.strip():
-                status = "FAILED"
-                errors.append("Нет входного текста")
-                raise RuntimeError("Нет входного текста")
+                raise RuntimeError("Нет входного текста идеи")
+            terms = rank_terms(blob, max_terms=120)
+            s_queries = seed_queries(terms, limit=12)
+            phases.append({"phase": "seed_query_build", "queries": s_queries[:8], "terms": terms[:20]})
 
-            ih = sha256(blob)
-            if os.path.exists(ckpt_path) and not args.fresh:
-                try:
-                    ck = json.load(open(ckpt_path, "r", encoding="utf-8"))
-                    if ck.get("version") == VERSION and ck.get("input_hash") == ih and ck.get("scope") == args.scope and int(ck.get("target_n", 0)) == int(args.n):
-                        rows = ck.get("rows_doi", []) or []
-                        if len(rows) >= min(int(args.n), max(50, int(args.min_keep))):
-                            log(L, f"[INFO] Использован checkpoint rows_doi={len(rows)}")
-                except Exception as e:
-                    log(L, f"[WARN] Ошибка чтения checkpoint: {e}")
-
-            if api_key:
-                try:
-                    client = OAClient(api_key=api_key, mailto=mailto, rps=float(args.rps), user_agent="IdeaPipeline-StageB/v9.1")
-                    binom = find_binomials(blob, limit=10)
-                    terms = rank_terms(blob, max_terms=80)
-                    domain_terms, method_terms = split_domain_method(terms, binom)
-                    seed_queries = build_seed_queries(domain_terms, method_terms)[:25]
-
-                    year_filter = f"publication_year:{int(args.from_year)}-{int(args.to_year)}"
-                    type_filter = "type:article|review"
-                    if args.scope == "wide":
-                        type_filter = "type:article|review|preprint|book-chapter"
-                    base_filters = [year_filter, type_filter]
-                    select_fields = ",".join([
-                        "id","doi","title","display_name","publication_year","publication_date","type","cited_by_count","language",
-                        "authorships","primary_location","abstract_inverted_index","topics","concepts","primary_topic"
-                    ])
-
-                    def capped() -> bool:
-                        return client.request_count >= int(args.request_cap)
-
-                    def run_phase(name: str, queries: List[str], sort: str, pages_each: int):
-                        ph = {"phase": name, "source": "openalex", "queries": [], "requests_start": client.request_count}
-                        total_added = 0
-                        for q in queries:
-                            if capped():
-                                break
-                            added = 0
-                            for w in client.list_works(search=q, filter_parts=base_filters, sort=sort, per_page=200, max_pages=pages_each, select_fields=select_fields, log_fp=L):
-                                if add_row(row_from_work(w, source=name)):
-                                    added += 1
-                            total_added += added
-                            ph["queries"].append({"query": q, "added": added})
-                        ph["added_total"] = total_added
-                        ph["requests_end"] = client.request_count
-                        phases.append(ph)
-
-                    run_phase("seed", seed_queries[:10], "relevance_score:desc", 2)
-
-                    topic_candidates = top_topic_ids(rows_all, topk=10)
-                    concept_candidates: List[str] = []
-                    ph_map = {"phase": "topic_or_concept_map", "source": "openalex", "keywords": domain_terms[:8], "requests_start": client.request_count}
-                    for kw in domain_terms[:8]:
-                        if capped():
-                            break
-                        try:
-                            for t in client.list_entities("/topics", search=kw, per_page=3, max_pages=1, log_fp=L):
-                                tid = (t.get("id") or "").replace("https://openalex.org/", "")
-                                if tid and tid not in topic_candidates:
-                                    topic_candidates.append(tid)
-                            for c in client.list_entities("/concepts", search=kw, per_page=3, max_pages=1, log_fp=L):
-                                cid = (c.get("id") or "").replace("https://openalex.org/", "")
-                                if cid and cid not in concept_candidates:
-                                    concept_candidates.append(cid)
-                        except Exception as e:
-                            errors.append(f"OpenAlex map: {type(e).__name__}: {e}")
-                            status = "DEGRADED"
-                    tgate = topic_candidates[:10]
-                    cgate = concept_candidates[:8]
-                    ph_map["topic_ids"] = tgate
-                    ph_map["concept_ids"] = cgate
-                    ph_map["requests_end"] = client.request_count
-                    phases.append(ph_map)
-
-                    dom_id, dom_share, dom_cnt = top_domain(rows_all)
-                    if dom_id and dom_share >= 0.35:
-                        dom_gate = dom_id
-
-                    ph_h = {"phase": "harvest_filter", "source": "openalex", "requests_start": client.request_count, "targets": []}
-                    per_id_pages = 3 if args.scope == "balanced" else 2
-                    for tid in tgate:
-                        if capped():
-                            break
-                        for sort in ["cited_by_count:desc", "publication_date:desc"]:
-                            added = 0
-                            f = [year_filter, type_filter, f"primary_topic.id:{tid}"]
-                            if dom_gate:
-                                f.append(f"primary_topic.domain.id:{dom_gate}")
-                            for w in client.list_works(search=None, filter_parts=f, sort=sort, per_page=200, max_pages=per_id_pages, select_fields=select_fields, log_fp=L):
-                                if add_row(row_from_work(w, source="harvest_filter")):
-                                    added += 1
-                            ph_h["targets"].append({"type": "topic", "id": tid, "sort": sort, "added": added})
-                    for cid in cgate:
-                        if capped():
-                            break
-                        for sort in ["cited_by_count:desc", "publication_date:desc"]:
-                            added = 0
-                            f = [year_filter, type_filter, f"concepts.id:{cid}"]
-                            for w in client.list_works(search=None, filter_parts=f, sort=sort, per_page=200, max_pages=2, select_fields=select_fields, log_fp=L):
-                                if add_row(row_from_work(w, source="harvest_filter")):
-                                    added += 1
-                            ph_h["targets"].append({"type": "concept", "id": cid, "sort": sort, "added": added})
-                    ph_h["requests_end"] = client.request_count
-                    ph_h["added_total"] = sum(t.get("added", 0) for t in ph_h["targets"])
-                    phases.append(ph_h)
-
-                    seeds_sorted = sorted([r for r in rows_all if r.get("openalex_id")], key=lambda r: -int(r.get("cited_by") or 0))
-                    ph_cit = {"phase": "citation_chase", "source": "openalex", "requests_start": client.request_count, "steps": []}
-                    for seed in seeds_sorted[:2]:
-                        if capped():
-                            break
-                        wid = seed.get("openalex_id")
-                        if not wid:
-                            continue
-                        for filt in [f"cites:{wid}", f"cited_by:{wid}"]:
-                            added = 0
-                            for w in client.list_works(search=None, filter_parts=[year_filter, type_filter, filt], sort="cited_by_count:desc", per_page=100, max_pages=1, select_fields=select_fields, log_fp=L):
-                                if add_row(row_from_work(w, source="citation_chase")):
-                                    added += 1
-                            ph_cit["steps"].append({"filter": filt, "added": added})
-                    ph_cit["requests_end"] = client.request_count
-                    ph_cit["added_total"] = sum(s.get("added", 0) for s in ph_cit["steps"])
-                    phases.append(ph_cit)
-
-                    oa_requests = client.request_count
-                    if capped():
+            if cfg["enable"].get("openalex") and secrets.get("OPENALEX_API_KEY"):
+                oa = OAClient(api_key=secrets.get("OPENALEX_API_KEY", ""), mailto=secrets.get("OPENALEX_MAILTO", ""), rps=args.rps)
+                sel = "id,doi,title,display_name,publication_year,publication_date,type,cited_by_count,language,authorships,primary_location,abstract_inverted_index,topics,concepts,primary_topic"
+                base = [f"publication_year:{args.from_year}-{args.to_year}"]
+                for q in s_queries:
+                    if oa.request_count >= min(int(args.request_cap), int(cfg["request_caps"].get("openalex", 160))):
+                        errors.append("Достигнут лимит OpenAlex request_cap")
                         status = "DEGRADED"
-                        errors.append("OpenAlex: достигнут лимит request-cap")
+                        break
+                    added = 0
+                    for w in oa.list_works(search=q, filter_parts=base, sort="relevance_score:desc", pages=1, select_fields=sel, log_fp=L):
+                        if add_row(row_from_work(w, "openalex:seed")):
+                            added += 1
+                    phases.append({"phase": "openalex_seed", "query": q, "added": added})
+
+                seed_sorted = sorted(rows_all, key=lambda r: int(r.get("cited_by") or 0), reverse=True)
+                token_profile, topic_profile = build_profile(seed_sorted, top_n=min(150, len(seed_sorted)))
+
+                top_seed = seed_sorted[:max(30, min(cfg["relevance_feedback"]["top_n"], len(seed_sorted)))]
+                grams = Counter()
+                for r in top_seed:
+                    tks = [t for t in tokenize(" ".join([r.get("title", ""), r.get("abstract", "")])) if t not in STOP]
+                    grams.update(make_ngrams(tks, 2))
+                    grams.update(make_ngrams(tks, 3))
+                rf_terms = [k for k, _ in grams.most_common(cfg["relevance_feedback"]["phrases"])]
+                rf_queries = [quote_term(x) for x in rf_terms[:cfg["relevance_feedback"]["queries"]]]
+                for q in rf_queries:
+                    if oa.request_count >= min(int(args.request_cap), int(cfg["request_caps"].get("openalex", 160))):
+                        status = "DEGRADED"
+                        break
+                    term_clean = q.replace('"', "")
+                    for w in oa.list_works(search=None, filter_parts=base + [f"title.search:{term_clean}"], sort="cited_by_count:desc", pages=1, select_fields=sel, log_fp=L):
+                        r = row_from_work(w, "openalex:feedback")
+                        d = drift_score(r, token_profile, topic_profile)
+                        r["_drift"] = d
+                        if d < float(cfg["drift"]["threshold"]):
+                            if len(rows_all) % max(1, int(1 / max(0.01, float(cfg["drift"]["explore_budget"])))) != 0:
+                                drift_filtered += 1
+                                continue
+                        add_row(r)
+                phases.append({"phase": "relevance_feedback", "rf_queries": rf_queries[:8], "added_total": len(rows_all)})
+                oa_requests = oa.request_count
+            else:
+                oa_requests = 0
+                status = "DEGRADED"
+                errors.append("OpenAlex отключен или отсутствует OPENALEX_API_KEY")
+
+            class NCBIClient(HttpClient):
+                def call(self, endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+                    p = dict(params)
+                    p["retmode"] = "json"
+                    if secrets.get("NCBI_API_KEY"):
+                        p["api_key"] = secrets["NCBI_API_KEY"]
+                    if secrets.get("NCBI_EMAIL"):
+                        p["email"] = secrets["NCBI_EMAIL"]
+                    return self.get_json(NCBI_BASE + endpoint + "?" + urllib.parse.urlencode(p, quote_via=urllib.parse.quote), headers={"User-Agent": "IdeaPipeline-StageB/v10"})
+
+            ncbi_requests = 0
+            if cfg["enable"].get("ncbi"):
+                try:
+                    nc = NCBIClient(rps=args.rps)
+                    qlist = ncbi_queries(terms, topn=12)
+                    for q in qlist:
+                        if nc.request_count >= int(cfg["request_caps"].get("ncbi", 80)):
+                            status = "DEGRADED"
+                            errors.append("Достигнут лимит NCBI")
+                            break
+                        ids = (((nc.call("/esearch.fcgi", {"db": "pubmed", "term": q, "retmax": "40", "sort": "relevance"}).get("esearchresult") or {}).get("idlist")) or [])
+                        added = 0
+                        dups = 0
+                        if ids:
+                            sm = nc.call("/esummary.fcgi", {"db": "pubmed", "id": ",".join(ids)})
+                            obj = sm.get("result") or {}
+                            for pid in (obj.get("uids") or []):
+                                rec = obj.get(pid) or {}
+                                rec["_pmid"] = pid
+                                if add_row(row_from_ncbi(rec, "ncbi")):
+                                    added += 1
+                                else:
+                                    dups += 1
+                        phases.append({"phase": "ncbi_query", "query": q, "found": len(ids), "added": added, "duplicates": dups})
+                    ncbi_requests = nc.request_count
                 except Exception as e:
                     status = "DEGRADED"
-                    errors.append(f"OpenAlex: {type(e).__name__}: {e}")
-                    phases.append({"phase": "seed", "source": "openalex", "status": "error", "reason": str(e)})
-                    phases.append({"phase": "topic_or_concept_map", "source": "openalex", "status": "error", "reason": "пропущено"})
-                    phases.append({"phase": "harvest_filter", "source": "openalex", "status": "error", "reason": "пропущено"})
-                    phases.append({"phase": "citation_chase", "source": "openalex", "status": "error", "reason": "пропущено"})
-            else:
-                status = "DEGRADED"
-                errors.append("OpenAlex: отсутствует OPENALEX_API_KEY")
-                phases.append({"phase": "seed", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
-                phases.append({"phase": "topic_or_concept_map", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
-                phases.append({"phase": "harvest_filter", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
-                phases.append({"phase": "citation_chase", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
+                    errors.append(f"NCBI недоступен: {type(e).__name__}: {e}")
 
-            try:
-                nc = NCBIClient(api_key=ncbi_key, mailto=mailto, rps=float(args.rps))
-                ncbi_terms = (domain_terms[:8] + method_terms[:8]) or rank_terms(blob, max_terms=24)
-                ncbi_terms = [t for t in ncbi_terms if t][:15]
-                queries = []
-                for t in ncbi_terms[:10]:
-                    queries.append(f"{quote_term(t)}[Title/Abstract]")
-                queries.extend(["systematic review[Title/Abstract]", "meta analysis[Title/Abstract]"])
-                uniq_q = []
-                seen = set()
-                for q in queries:
-                    if q not in seen:
-                        uniq_q.append(q)
-                        seen.add(q)
-                uniq_q = uniq_q[:12]
-                ph = {"phase": "ncbi_search", "source": "ncbi", "queries": uniq_q, "requests_start": nc.request_count, "query_stats": []}
-                all_ids: List[str] = []
-                for q in uniq_q:
-                    ids = nc.esearch(q, retmax=120)
-                    ph["query_stats"].append({"query": q, "pmids": len(ids)})
-                    all_ids.extend(ids)
-                uniq_ids = []
-                seen_ids = set()
-                for pid in all_ids:
-                    if pid not in seen_ids:
-                        uniq_ids.append(pid)
-                        seen_ids.add(pid)
-                uniq_ids = uniq_ids[:1200]
-                added = 0
-                for i in range(0, len(uniq_ids), 40):
-                    pack = uniq_ids[i:i+40]
-                    for rec in nc.esummary(pack):
-                        if add_row(row_from_ncbi(rec, source="ncbi_search")):
-                            added += 1
-                ph["requests_end"] = nc.request_count
-                ph["pmids_total"] = len(uniq_ids)
-                ph["added_total"] = added
-                phases.append(ph)
-                ncbi_requests = nc.request_count
-                if len(uniq_q) < 5:
-                    status = "DEGRADED"
-                    errors.append("NCBI: выполнено менее 5 запросов")
-            except Exception as e:
-                status = "DEGRADED"
-                errors.append(f"NCBI: {type(e).__name__}: {e}")
-                phases.append({"phase": "ncbi_search", "source": "ncbi", "status": "error", "reason": str(e)})
+            crossref_requests = 0
+            if cfg["enable"].get("crossref") and secrets.get("CROSSREF_MAILTO"):
+                cr = HttpClient(rps=max(1.0, args.rps))
+                for r in rows_all[:1000]:
+                    if r.get("doi"):
+                        continue
+                    title = r.get("title") or ""
+                    if not title:
+                        continue
+                    q = urllib.parse.urlencode({"query.title": title, "rows": "3", "mailto": secrets["CROSSREF_MAILTO"]})
+                    try:
+                        j = cr.get_json(CROSSREF_BASE + "?" + q, headers={"User-Agent": "IdeaPipeline-StageB/v10"}, log_fp=L)
+                        cand = ((j.get("message") or {}).get("items") or [])
+                        if not cand:
+                            continue
+                        c0 = cand[0]
+                        doi = c0.get("DOI") or ""
+                        ctitle = ((c0.get("title") or [""])[0] or "")
+                        sim = cosine(Counter(tokenize(title)), Counter(tokenize(ctitle)))
+                        if doi and sim >= 0.80:
+                            r["doi"] = doi
+                            r["_crossref_confidence"] = round(sim, 3)
+                        elif doi:
+                            phases.append({"phase": "crossref_candidate", "title": title[:120], "doi": doi, "confidence": round(sim, 3)})
+                    except Exception as e:
+                        status = "DEGRADED"
+                        errors.append(f"Crossref ошибка: {type(e).__name__}")
+                        break
+                crossref_requests = cr.request_count
 
-            anchors = build_anchor_set(domain_terms, method_terms)
+            seed_tokens, seed_topics = build_profile(rows_all, top_n=160)
             for r in rows_all:
-                r["_score"] = score_row(r, anchors)
-            rows_sorted = sorted(rows_all, key=lambda r: (int(r.get("_score") or 0), int(r.get("cited_by") or 0), str(r.get("publication_date") or "")), reverse=True)
+                drift = drift_score(r, seed_tokens, seed_topics)
+                text = " ".join([r.get("title", ""), r.get("abstract", ""), r.get("topics", ""), r.get("concepts", "")]).lower()
+                lexical = sum(1 for t in terms[:40] if t in text)
+                rec = 1.0 if str(r.get("year") or "").isdigit() and int(r.get("year") or 0) >= 2019 else 0.0
+                found = math.log1p(max(0, int(r.get("cited_by") or 0))) / 6.0
+                r["score"] = round(1.8 * drift + 0.6 * lexical + 0.25 * rec + 0.35 * found, 4)
 
-            target_n = int(args.n)
-            rows_doi = [r for r in rows_sorted if r.get("doi")]
-            final_rows = rows_doi[:target_n] if len(rows_doi) >= int(args.min_keep) else rows_sorted[:target_n]
-            top100 = final_rows[:100]
-            hit = sum(1 for r in top100 if int(r.get("_score") or 0) >= 2)
-            hit_rate = hit / max(1, len(top100))
-            phases.append({"phase": "final_select", "source": "pipeline", "selected": len(final_rows), "doi_selected": len([r for r in final_rows if r.get('doi')])})
+            rows_ranked = sorted(rows_all, key=lambda x: (float(x.get("score") or 0.0), int(x.get("cited_by") or 0)), reverse=True)
+            div = cfg["diversity"]
+            final_n = args.n if args.scope != "focused" else min(300, max(200, args.n))
+            final_rows = mmr_select(rows_ranked, final_n, int(div["max_per_venue"]), int(div["max_per_topic"]), float(div["mmr_lambda"]))
 
-            save_csv(corpus_path, strip(final_rows))
-            save_csv(corpus_all_path, strip(rows_sorted[:max(1500, target_n * 6)]))
+            unpaywall_requests = 0
+            if cfg["enable"].get("unpaywall") and secrets.get("UNPAYWALL_EMAIL"):
+                up = HttpClient(rps=max(1.0, args.rps))
+                for r in final_rows[:min(1000, len(final_rows))]:
+                    doi = r.get("doi")
+                    if not doi:
+                        continue
+                    try:
+                        j = up.get_json(f"{UNPAYWALL_BASE}/{urllib.parse.quote(doi)}?email={urllib.parse.quote(secrets['UNPAYWALL_EMAIL'])}", log_fp=L)
+                        r["oa_pdf_url"] = ((j.get("best_oa_location") or {}).get("url_for_pdf") or "")
+                        r["best_url"] = ((j.get("best_oa_location") or {}).get("url") or "")
+                        if r.get("oa_pdf_url") or r.get("best_url"):
+                            r["score"] = round(float(r.get("score") or 0.0) + 0.15, 4)
+                    except Exception:
+                        status = "DEGRADED"
+                unpaywall_requests = up.request_count
 
-            if args.scope == "balanced" and count_csv_rows(corpus_all_path) < 1500:
+            final_rows = sorted(final_rows, key=lambda x: float(x.get("score") or 0.0), reverse=True)
+
+            target_min, target_max = cfg["targets"].get(args.scope, [1500, 3000])
+            corpus_all_cap = max(target_min, min(target_max, max(8000 if args.scope == "wide" else 3000, args.n * 8)))
+            save_csv(corpus_path, [{k: v for k, v in r.items() if not k.startswith("_")} for r in final_rows])
+            save_csv(corpus_all_path, [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows_ranked[:corpus_all_cap]])
+
+            if count_csv_rows(corpus_all_path) < int(target_min):
                 status = "DEGRADED"
-                errors.append("Не удалось набрать 1500+ записей в corpus_all.csv (ограничения API/лимитов)")
-            if len(final_rows) < int(args.min_keep):
-                status = "DEGRADED"
-                errors.append(f"Мало записей: {len(final_rows)} < min_keep={int(args.min_keep)}")
-            if len(top100) >= 50 and hit_rate < float(args.min_anchor_hit):
-                status = "DEGRADED"
-                errors.append(f"Низкая релевантность: {hit_rate:.2f} < {float(args.min_anchor_hit):.2f}")
+                errors.append(f"Не достигнут минимальный объём corpus_all для режима {args.scope}")
+
+            with open(field_map_path, "w", encoding="utf-8") as f:
+                f.write("# Карта поля (Stage B)\n\n")
+                f.write(f"- Версия: {VERSION}\n")
+                f.write(f"- Статус: {status}\n")
+                f.write(f"- Топ-термы seed: {', '.join(terms[:20])}\n")
+                f.write(f"- Уникальных topics: {len(set(sum([r.get('_topic_ids', []) for r in rows_all], [])))}\n")
+
+            with open(prisma_path, "w", encoding="utf-8") as f:
+                f.write("# PRISMA-lite (Stage B)\n\n")
+                f.write(f"- Статус: {status}\n")
+                f.write(f"- Добавлено: {dict(source_stats)}\n")
+                f.write(f"- До дедуп: {dedup_before}\n")
+                f.write(f"- После дедуп: {len(dedup_seen)}\n")
+                f.write(f"- corpus_all: {count_csv_rows(corpus_all_path)}\n")
+                f.write(f"- corpus: {count_csv_rows(corpus_path)}\n")
 
             search_log = {
                 "module": "B", "version": VERSION, "datetime_utc": utc_now(), "status": status,
-                "target_n": target_n, "kept": len(final_rows), "kept_doi": len([r for r in final_rows if r.get("doi")]),
-                "requests": {"openalex": oa_requests, "ncbi": ncbi_requests},
-                "seed_queries": seed_queries, "domain_terms": domain_terms, "method_terms": method_terms,
-                "domain_gate": dom_gate, "domain_share_seed": dom_share, "domain_counts_seed": dom_cnt,
-                "topic_gate_ids": [f"https://openalex.org/{x}" for x in tgate],
-                "concept_gate_ids": [f"https://openalex.org/{x}" for x in cgate],
-                "quality": {"anchor_hit_rate_top100": hit_rate, "top100_hits_ge2": hit, "anchors_count": len(anchors)},
-                "source_stats": source_stats,
-                "dedup_keys": len(dedup_seen),
-                "errors": errors,
-                "phases": phases,
+                "target_n": final_n, "requests": {"openalex": oa_requests, "ncbi": ncbi_requests, "crossref": crossref_requests, "unpaywall": unpaywall_requests},
+                "source_stats": dict(source_stats), "dedup": {"before": dedup_before, "after": len(dedup_seen)},
+                "seed_queries": s_queries, "errors": errors, "phases": phases,
             }
             with open(search_log_path, "w", encoding="utf-8") as f:
                 json.dump(search_log, f, ensure_ascii=False, indent=2)
 
-            with open(os.path.join(out_dir, "field_map.md"), "w", encoding="utf-8") as f:
-                f.write("# Карта поля (Stage B)\n\n")
-                f.write(f"- Версия: {VERSION}\n")
-                f.write(f"- Статус: **{status}**\n")
-                f.write(f"- OpenAlex gate domain: `{dom_gate or 'OFF'}` share={dom_share:.2f}\n")
-                f.write(f"- Top topics gate: {len(tgate)}\n")
-                f.write(f"- Top concepts gate: {len(cgate)}\n")
-
-            with open(os.path.join(out_dir, "prisma_lite.md"), "w", encoding="utf-8") as f:
-                f.write("# PRISMA-lite (Stage B)\n\n")
-                f.write("- Источники: OpenAlex, NCBI\n")
-                f.write(f"- Статус: {status}\n")
-                f.write(f"- Добавлено OpenAlex: {source_stats.get('openalex',0)}\n")
-                f.write(f"- Добавлено NCBI: {source_stats.get('ncbi',0)}\n")
-                f.write(f"- В итоговом корпусе: {len(final_rows)}\n")
-                f.write(f"- В расширенном корпусе: {count_csv_rows(corpus_all_path)}\n")
-
-            ckpt = {"version": VERSION, "input_hash": ih, "scope": args.scope, "target_n": target_n,
-                    "rows_doi": strip(final_rows), "rows_all": strip(rows_sorted[:max(target_n, 1500)]), "search_log": search_log}
+            ckpt = {"version": VERSION, "input_hash": hashlib.sha256(blob.encode("utf-8", errors="ignore")).hexdigest(), "scope": args.scope,
+                    "rows_doi": [{k: v for k, v in r.items() if not k.startswith("_")} for r in final_rows if r.get("doi")],
+                    "rows_all": [{k: v for k, v in r.items() if not k.startswith("_")} for r in rows_ranked[:max(args.n, 1500)]], "search_log": search_log}
             with open(ckpt_path, "w", encoding="utf-8") as f:
                 json.dump(ckpt, f, ensure_ascii=False, indent=2)
+
         except Exception as e:
             status = "FAILED" if status == "OK" else status
             errors.append(f"FATAL: {type(e).__name__}: {e}")
             log(L, f"[ERR] Необработанная ошибка: {type(e).__name__}: {e}")
-            if not os.path.exists(corpus_path):
-                save_csv(corpus_path, [])
-            if not os.path.exists(corpus_all_path):
-                save_csv(corpus_all_path, [])
+            save_csv(corpus_path, [])
+            save_csv(corpus_all_path, [])
             with open(search_log_path, "w", encoding="utf-8") as f:
                 json.dump({"module": "B", "version": VERSION, "status": status, "errors": errors, "phases": phases}, f, ensure_ascii=False, indent=2)
         finally:
-            summary_text = write_stage_summary(
-                summary_path,
-                status=status,
-                started_utc=started_utc,
-                source_stats=source_stats,
-                dedup_total=len(dedup_seen),
-                corpus_path=corpus_path,
-                corpus_all_path=corpus_all_path,
-                errors=errors,
-                search_log_path=search_log_path,
-                module_log_path=log_path,
-                checkpoint_path=ckpt_path,
-                requests={"openalex": oa_requests, "ncbi": ncbi_requests},
-            )
-            print(summary_text, end="")
-            log(L, f"[INFO] Финальный статус: {status}")
+            oa_rate = 0.0
+            if rows_all:
+                oa_rate = sum(1 for r in final_rows if r.get("oa_pdf_url") or r.get("best_url")) / max(1, len(final_rows))
+            doi_cov = sum(1 for r in final_rows if r.get("doi")) / max(1, len(final_rows))
+            uniq_venues = len(set((r.get("venue") or "").strip().lower() for r in final_rows if (r.get("venue") or "").strip()))
+            uniq_topics = len(set(sum([r.get("_topic_ids") or [] for r in final_rows], [])))
+            summary = write_stage_summary(summary_path, {
+                "status": status,
+                "started_utc": started_utc,
+                "elapsed_sec": round(time.time() - started_ts, 1),
+                "requests": {
+                    "openalex": oa_requests if 'oa_requests' in locals() else 0,
+                    "ncbi": ncbi_requests if 'ncbi_requests' in locals() else 0,
+                    "crossref": crossref_requests if 'crossref_requests' in locals() else 0,
+                    "unpaywall": unpaywall_requests if 'unpaywall_requests' in locals() else 0,
+                },
+                "source_stats": dict(source_stats),
+                "dedup_before": dedup_before,
+                "dedup_after": len(dedup_seen),
+                "corpus_all": count_csv_rows(corpus_all_path),
+                "corpus": count_csv_rows(corpus_path),
+                "doi_coverage": doi_cov,
+                "oa_rate": oa_rate,
+                "unique_venues": uniq_venues,
+                "unique_topics": uniq_topics,
+                "drift_filtered_pct": drift_filtered / max(1, dedup_before),
+                "errors": errors,
+            })
+            print(summary, end="")
 
     return 0 if status in ("OK", "DEGRADED") else 1
+
 
 if __name__ == "__main__":
     try:

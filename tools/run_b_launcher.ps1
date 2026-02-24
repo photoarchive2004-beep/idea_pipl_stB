@@ -2,7 +2,8 @@ param(
   [ValidateSet("balanced","wide","focused")]
   [string]$Scope = "balanced",
   [string]$IdeaArg = "",
-  [int]$N = 300
+  [int]$N = 300,
+  [switch]$NoPause
 )
 
 $ErrorActionPreference = "Stop"
@@ -88,9 +89,11 @@ try {
     Log "[ERR] Не найден out\stageB_summary.txt"
     $code = 1
   }
+  if (-not $NoPause) { Read-Host "Нажмите Enter для завершения" | Out-Null }
   exit $code
 }
 catch {
   Log ("[ERR] " + $_.Exception.Message)
+  if (-not $NoPause) { Read-Host "Нажмите Enter для завершения" | Out-Null }
   exit 1
 }
