@@ -1,0 +1,31 @@
+﻿## Problem
+(1–3 абзаца) Что именно непонятно/необъяснено? Почему это важно?
+
+## Observations
+- Факт/паттерн 1
+- Факт/паттерн 2
+
+## Main hypothesis
+- H1: ...
+
+## Alternative hypotheses (минимум 2)
+- H2: ...
+- H3: ...
+
+## Predictions
+### H1
+- ...
+### H2
+- ...
+### H3
+- ...
+
+## Decisive minimal tests (1–3)
+- Test 1: данные → анализ → ожидаемое различие по H1/H2/H3
+- Test 2: ...
+
+## Constraints
+- What you can/can't do quickly (data, budget, access, time)
+
+## Seeds (optional)
+- DOI/PMID/URL

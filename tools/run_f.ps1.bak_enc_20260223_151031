@@ -1,0 +1,139 @@
+param(
+  [string]$IdeaDir = "",
+  [switch]$All,
+  [switch]$AskLLM
+)
+
+# --- Encoding / Unicode safety ---
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try { chcp 65001 | Out-Null } catch {}
+# ---------------------------------
+
+
+$Root = Split-Path -Parent $PSScriptRoot
+Set-Location $Root
+
+$LogDir = Join-Path $Root "launcher_logs"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$Log = Join-Path $LogDir ("runF_" + $stamp + ".log")
+$Log | Out-File -FilePath (Join-Path $LogDir "LAST_LOG.txt") -Encoding UTF8
+
+function LogLine([string]$s) {
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+  "$ts $s" | Out-File -FilePath $Log -Append -Encoding UTF8
+  Write-Host $s
+}
+
+function Resolve-IdeaDir([string]$p) {
+  if ([string]::IsNullOrWhiteSpace($p)) { return "" }
+  if (-not (Test-Path $p)) {
+    $cand = Join-Path $Root $p
+    if (Test-Path $cand) { $p = $cand }
+  }
+  return (Resolve-Path $p).Path
+}
+
+try {
+  LogLine "[DIAG] Root=$Root"
+  LogLine "[DIAG] IdeaDir(arg)='$IdeaDir'"
+  LogLine "[DIAG] All=$All AskLLM=$AskLLM"
+
+  $py = Join-Path $Root ".venv\Scripts\python.exe"
+  $script = Join-Path $Root "tools\f_dual_scoring.py"
+  if (-not (Test-Path $py)) { throw "Python venv not found: $py (run 0_SETUP.bat)" }
+  if (-not (Test-Path $script)) { throw "Not found: $script" }
+
+  $failed = 0
+
+  if ($All) {
+    $ideas = Join-Path $Root "ideas"
+    if (-not (Test-Path $ideas)) { throw "Folder 'ideas' not found." }
+    $dirs = Get-ChildItem -Directory $ideas | Sort-Object LastWriteTime -Descending
+    if (-not $dirs) { throw "No idea folders inside 'ideas'." }
+
+    LogLine "[INFO] Processing ALL ideas: $($dirs.Count)"
+    foreach ($d in $dirs) {
+      $IdeaDir2 = $d.FullName
+      LogLine "[INFO] ---- Idea: $IdeaDir2 ----"
+      $args = @("--idea", $IdeaDir2)
+      if ($AskLLM) { $args += "--ask-llm" }
+      LogLine ("[CMD] $py $script " + ($args -join " "))
+
+      $oldEAP = $ErrorActionPreference
+      $ErrorActionPreference = "Continue"
+      & $py $script @args 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
+      $ErrorActionPreference = $oldEAP
+
+      $rc = $LASTEXITCODE
+      LogLine "[DIAG] ExitCode=$rc"
+      if ($rc -ne 0 -and $rc -ne 2) { $failed++ }
+
+      if ($rc -eq 2) {
+        $prompt = Join-Path $IdeaDir2 "out\llm_prompt_F.txt"
+        $target = Join-Path $IdeaDir2 "in\llm_stageF.json"
+        if (Test-Path $prompt) {
+          LogLine "[NEXT] LLM step requested for this idea (AskLLM mode). Prompt file exists."
+          LogLine "[NEXT] Paste prompt into ChatGPT/Gemini, then paste JSON into: $target"
+        }
+      }
+    }
+
+    if ($failed -gt 0) {
+      LogLine "[WARN] Some ideas finished with non-zero exit code: $failed"
+      exit 1
+    } else {
+      LogLine "[OK] Done. Stage F generated for all ideas."
+      exit 0
+    }
+  }
+
+  if ([string]::IsNullOrWhiteSpace($IdeaDir)) {
+    $ideas = Join-Path $Root "ideas"
+    if (-not (Test-Path $ideas)) { throw "Folder 'ideas' not found. Run 1_NEW_IDEA.bat first." }
+    $latest = Get-ChildItem -Directory $ideas | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $latest) { throw "No idea folders inside 'ideas'. Run 1_NEW_IDEA.bat first." }
+    $IdeaDir = $latest.FullName
+    LogLine "[INFO] Using newest idea folder: $IdeaDir"
+  } else {
+    $IdeaDir = Resolve-IdeaDir $IdeaDir
+    LogLine "[INFO] Using idea folder: $IdeaDir"
+  }
+
+  $args = @("--idea", $IdeaDir)
+  if ($AskLLM) { $args += "--ask-llm" }
+  LogLine ("[CMD] $py $script " + ($args -join " "))
+
+  $oldEAP = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  & $py $script @args 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
+  $ErrorActionPreference = $oldEAP
+
+  $rc = $LASTEXITCODE
+  LogLine "[DIAG] ExitCode=$rc"
+
+  if ($rc -eq 2) {
+    $prompt = Join-Path $IdeaDir "out\llm_prompt_F.txt"
+    $target = Join-Path $IdeaDir "in\llm_stageF.json"
+    if (Test-Path $prompt) {
+      Set-Clipboard -Value (Get-Content -Raw -Encoding UTF8 $prompt)
+      LogLine "[OK] Prompt copied to clipboard."
+      LogLine "[NEXT] 1) Paste prompt into ChatGPT/Gemini."
+      LogLine "[NEXT] 2) Copy ONLY JSON and paste into: $target"
+      if (-not (Test-Path $target)) { New-Item -ItemType File -Force -Path $target | Out-Null }
+      Start-Process notepad.exe -ArgumentList $target | Out-Null
+      Start-Process explorer.exe -ArgumentList $IdeaDir | Out-Null
+    } else {
+      LogLine "[WARN] Prompt not found: $prompt"
+    }
+    exit 2
+  }
+
+  exit $rc
+}
+catch {
+  LogLine "[FATAL] $($_.Exception.Message)"
+  LogLine ($_.ScriptStackTrace | Out-String)
+  exit 1
+}

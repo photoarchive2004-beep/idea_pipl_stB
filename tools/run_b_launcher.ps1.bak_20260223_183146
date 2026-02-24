@@ -1,0 +1,146 @@
+\
+param(
+  [ValidateSet('balanced','wide','focused')]
+  [string]$Scope = 'balanced',
+  [string]$IdeaArg = '',
+  [int]$N = 300
+)
+
+# --- Encoding / Unicode safety ---
+$OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::OutputEncoding = $OutputEncoding
+try { chcp 65001 | Out-Null } catch {}
+# ---------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+$toolsDir = $PSScriptRoot
+$root = Split-Path -Parent $toolsDir
+Set-Location $root
+
+function Say([string]$s){ Write-Host $s }
+function Die([string]$s){ throw $s }
+
+$ideasDir = Join-Path $root 'ideas'
+if (-not (Test-Path $ideasDir)) { Die "Нет папки ideas. Сначала запусти 1_NEW_IDEA.bat" }
+
+function Resolve-IdeaDir([string]$arg) {
+  # 1) explicit argument
+  if ($arg -and $arg.Trim()) {
+    $p = $arg.Trim()
+    if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $root $p }
+    $p = [IO.Path]::GetFullPath($p)
+    $leaf = (Split-Path -Leaf $p)
+    if ($leaf -ieq 'out' -or $leaf -ieq 'in') { $p = Split-Path -Parent $p }
+    if (-not (Test-Path $p)) { Die "Папка идеи не найдена: $p" }
+    return $p
+  }
+
+  # 2) active pointer (created by 1_NEW_IDEA.bat)
+  $active = Join-Path $ideasDir '_ACTIVE_PATH.txt'
+  if (Test-Path $active) {
+    $p = (Get-Content -LiteralPath $active -Raw).Trim()
+    if ($p) {
+      if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $root $p }
+      $p = [IO.Path]::GetFullPath($p)
+      if (Test-Path $p) { return $p }
+    }
+  }
+
+  # 3) last IDEA-* with Stage A output
+  $cands = Get-ChildItem -LiteralPath $ideasDir -Directory -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -like 'IDEA-*' } |
+           Sort-Object Name -Descending
+
+  $withA = $cands | Where-Object { Test-Path (Join-Path $_.FullName 'out\structured_idea.json') } | Select-Object -First 1
+  if ($withA) { return $withA.FullName }
+
+  $first = $cands | Select-Object -First 1
+  if ($first) { return $first.FullName }
+
+  Die "В папке ideas нет ни одной IDEA-*"
+}
+
+$ideaDir = Resolve-IdeaDir $IdeaArg
+$ideaDir = (Resolve-Path $ideaDir).Path
+$ideaName = Split-Path $ideaDir -Leaf
+
+Say ("[INFO] ROOT=" + $root)
+Say ("[INFO] IDEA=" + $ideaName)
+Say ("[INFO] SCOPE=" + $Scope)
+Say ("[INFO] N=" + $N)
+
+# preflight: required inputs
+$inJson = Join-Path $ideaDir 'out\structured_idea.json'
+if (-not (Test-Path $inJson)) {
+  Die ("Не найден вход Stage B: " + $inJson + "`nСначала пройди Stage A (RUN_A.bat).")
+}
+
+# preflight: secrets
+$secrets = Join-Path $root 'config\secrets.env'
+if (-not (Test-Path $secrets)) {
+  Die ("Не найден config\secrets.env. Запусти 0_SETUP.bat")
+}
+$txt = ""
+try { $txt = Get-Content -LiteralPath $secrets -Raw } catch {}
+if ($txt -notmatch '(?m)^\s*OPENALEX_API_KEY\s*=\s*\S+') {
+  Say ""
+  Say "❌ Не задан OPENALEX_API_KEY в config\secrets.env"
+  Say "Открою файл — вставь ключ и сохрани, затем запусти RUN_B.bat ещё раз."
+  Start-Process notepad.exe -ArgumentList $secrets | Out-Null
+  exit 2
+}
+
+# checkpoint freshness on scope change (keep old behavior)
+$outDir = Join-Path $ideaDir 'out'
+$ckpt = Join-Path $outDir '_moduleB_checkpoint.json'
+$searchLog = Join-Path $outDir 'search_log.json'
+
+$lastScope = ''
+if (Test-Path $searchLog) {
+  try {
+    $sl = Get-Content -LiteralPath $searchLog -Raw | ConvertFrom-Json
+    if ($sl.PSObject.Properties.Name -contains 'scope') { $lastScope = [string]$sl.scope }
+  } catch { }
+}
+
+if ($lastScope -and ($lastScope -ne $Scope)) {
+  Say ("[INFO] Scope changed: " + $lastScope + " -> " + $Scope + " ; deleting checkpoint for fresh run")
+  Remove-Item -Force -Path $ckpt -ErrorAction SilentlyContinue
+} elseif ((-not $lastScope) -and ($Scope -ne 'balanced')) {
+  Say ("[INFO] No scope in search_log.json; for WIDE/FOCUSED do fresh run (delete checkpoint)")
+  Remove-Item -Force -Path $ckpt -ErrorAction SilentlyContinue
+} else {
+  Say ("[INFO] Using existing checkpoint (if any). LastScope=" + $lastScope)
+}
+
+# python (force venv like Stage A to avoid surprises)
+$py = Join-Path $root '.venv\Scripts\python.exe'
+if (-not (Test-Path $py)) { Die "Не найден .venv. Запусти 0_SETUP.bat" }
+
+$script = Join-Path $root 'tools\b_lit_scout.py'
+if (-not (Test-Path $script)) { Die ("Не найден скрипт: " + $script) }
+
+Say ("[INFO] PY=" + $py)
+Say ("[INFO] RUN=python b_lit_scout.py --idea-dir `"$ideaDir`" --n $N --scope $Scope")
+Say ""
+
+& $py $script --idea-dir $ideaDir --n $N --scope $Scope
+$rc = $LASTEXITCODE
+
+if ($rc -eq 0) {
+  Say ""
+  Say "✅ Stage B готова."
+  exit 0
+}
+
+Say ""
+Say ("❌ Stage B: ошибка (ExitCode=" + $rc + ").")
+$modLog = Join-Path $outDir 'module_B.log'
+if (Test-Path $modLog) {
+  Say "Открою module_B.log"
+  Start-Process notepad.exe -ArgumentList $modLog | Out-Null
+} else {
+  Say "Лог Stage B не найден: module_B.log"
+}
+exit $rc

@@ -1,0 +1,8 @@
+﻿2026-02-23 14:29:16 [DIAG] Root=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2
+2026-02-23 14:29:16 [DIAG] basePy=C:\Users\artae\AppData\Local\Programs\Python\Python311\python.exe
+2026-02-23 14:29:16 [INFO] Creating .venv ...
+2026-02-23 14:29:32 [DIAG] venvPy=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\.venv\Scripts\python.exe
+2026-02-23 14:29:32 [INFO] Upgrading pip ...
+2026-02-23 14:29:45 [INFO] Installing requirements from: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\requirements.txt
+2026-02-23 14:30:07 [OK] Setup finished successfully.
+2026-02-23 14:30:07 [NEXT] If you plan to run Stage B, put your OPENALEX_API_KEY into config\\secrets.env

@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+from __future__ import annotations
+import argparse, csv, hashlib, json, os, re, sys, time, urllib.parse, urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+BASE = "https://api.openalex.org"
+VERSION = "v7.3-topicgate"
+
+CSV_COLS = ["source","openalex_id","doi","title","year","type","venue","authors","cited_by","language","top_topics","top_concepts","abstract"]
+
+RU2EN = {
+  "переносимость":"transferability","переносимост":"transferability",
+  "связность":"connectivity","связности":"connectivity",
+  "река":"river","речной":"river","озеро":"lake",
+  "рыба":"fish","рыбы":"fish","гольян":"minnow",
+  "геномика":"genomics","геномный":"genomic","популяция":"population","популяционный":"population",
+  "адаптация":"adaptation","интрогрессия":"introgression","демография":"demography",
+  "поток":"flow","миграция":"migration","расселение":"range expansion","рефугиум":"refugium",
+  "изоляция":"isolation","дистанция":"distance","сопротивление":"resistance",
+}
+
+EN_STOP = set("""
+the and for with from into about this that those these have has had were was are is be been being
+study studies result results method methods data analysis analyses using use used based across between
+""".split())
+RU_STOP = set("и в во не что он на я с со как а то все она так его но да ты к у же вы за бы по только еще нет из".split())
+
+def utc_now() -> str:
+  return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def now_local() -> str:
+  return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def log(fp, msg: str) -> None:
+  fp.write(f"[{now_local()}] {msg}\n"); fp.flush()
+
+def read_text(path: str) -> str:
+  try:
+    with open(path,"r",encoding="utf-8",errors="replace") as f: return f.read()
+  except Exception:
+    return ""
+
+def read_env_file(path: str) -> Dict[str,str]:
+  out = {}
+  if not os.path.exists(path): return out
+  with open(path,"r",encoding="utf-8",errors="replace") as f:
+    for line in f:
+      line=line.strip()
+      if not line or line.startswith("#") or "=" not in line: continue
+      k,v=line.split("=",1)
+      out[k.strip()] = v.strip().strip('"').strip("'")
+  return out
+
+def get_api_key(root_dir: str) -> Tuple[Optional[str], Optional[str]]:
+  env = read_env_file(os.path.join(root_dir,"config","secrets.env"))
+  key = env.get("OPENALEX_API_KEY") or os.environ.get("OPENALEX_API_KEY")
+  mailto = env.get("OPENALEX_MAILTO") or os.environ.get("OPENALEX_MAILTO")
+  return key, mailto
+
+def normalize_id(x: str) -> str:
+  if not x: return ""
+  m = re.search(r"/(W\d+)$", x)
+  if m: return m.group(1)
+  m = re.match(r"^(W\d+)$", x)
+  return m.group(1) if m else x
+
+def reconstruct_abstract(inv: Dict[str, List[int]]) -> str:
+  if not inv: return ""
+  pos={}
+  for w,ps in inv.items():
+    for p in ps:
+      try: pos[int(p)] = w
+      except Exception: pass
+  if not pos: return ""
+  return " ".join(pos[i] for i in sorted(pos.keys())).replace(" ,",",").replace(" .",".")
+
+def sanitize_query(q: str) -> str:
+  q = (q or "").strip()
+  q = re.sub(r"\s+"," ", q)
+  return q
+
+def has_cyr(s: str) -> bool:
+  return bool(re.search(r"[А-Яа-яЁё]", s or ""))
+
+def tokenize(text: str) -> List[str]:
+  return re.findall(r"[A-Za-zА-Яа-яЁё][A-Za-zА-Яа-яЁё0-9\-]{2,}", text or "")
+
+def norm_token(t: str) -> str:
+  t = (t or "").strip().lower()
+  if not t: return ""
+  if t in EN_STOP or t in RU_STOP: return ""
+  # map RU -> EN
+  if has_cyr(t):
+    t = RU2EN.get(t, "")
+    if not t: return ""
+  t = re.sub(r"\s+"," ", t).strip()
+  if not t or t in EN_STOP: return ""
+  return t
+
+def find_binomials(text: str, limit: int = 8) -> List[str]:
+  pat = re.compile(r"\b([A-Z][a-z]{2,})\s+([a-z]{3,})(?:\s+([a-z]{3,}))?\b")
+  out=[]
+  for m in pat.finditer(text or ""):
+    g,s,ss = m.group(1), m.group(2), m.group(3)
+    phrase = f"{g} {s}" + (f" {ss}" if ss else "")
+    out.append(phrase)
+    if len(out)>=limit: break
+  # unique preserve order
+  seen=set(); uniq=[]
+  for x in out:
+    if x not in seen: uniq.append(x); seen.add(x)
+  return uniq
+
+def rank_terms(text: str, max_terms: int = 40) -> List[str]:
+  freq={}
+  for tok in tokenize(text):
+    nt = norm_token(tok)
+    if not nt: continue
+    freq[nt] = freq.get(nt,0)+1
+  ranked = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+  return [k for k,_ in ranked[:max_terms]]
+
+def build_queries(text: str) -> List[str]:
+  text = re.sub(r"\s+"," ", (text or "")).strip()
+  binom = find_binomials(text, limit=6)
+  terms = rank_terms(text, max_terms=50)
+
+  # anchors: binomials + top english tokens
+  anchors=[]
+  anchors += binom[:2]
+  for t in terms:
+    if t not in anchors: anchors.append(t)
+    if len(anchors) >= 8: break
+
+  # if nothing useful, fallback
+  if not anchors:
+    anchors = ["genomics","population","phylogeography"]
+
+  qs=[]
+  # single anchors
+  qs += [a for a in anchors[:6]]
+  # pairs with AND (short)
+  for i in range(min(5,len(anchors))):
+    for j in range(i+1, min(i+3, len(anchors))):
+      a,b = anchors[i], anchors[j]
+      # boolean operators must be UPPERCASE in OpenAlex
+      qs.append(f"{a} AND {b}")
+
+  # method/review variants
+  for q in list(qs)[:8]:
+    qs.append(f"{q} AND review")
+    qs.append(f"{q} AND method*")
+
+  # domain helpful fallbacks (still universal)
+  qs += [
+    "landscape genomics",
+    "riverscape genetics",
+    "genotype environment association",
+    "isolation by distance",
+    "isolation by resistance",
+    "population genomics",
+    "gene flow connectivity",
+  ]
+
+  out=[]; seen=set()
+  for q in qs:
+    q = sanitize_query(q)
+    if not q or q in seen: continue
+    # keep queries reasonably short
+    if len(q.split()) > 8: continue
+    out.append(q); seen.add(q)
+    if len(out) >= 18: break
+  return out
+
+@dataclass
+class OAClient:
+  api_key: str
+  mailto: Optional[str] = None
+  rps: float = 2.0
+  timeout: int = 40
+  max_retries: int = 6
+  user_agent: str = "IdeaPipeline-StageB/v7.3"
+  request_count: int = 0
+
+  def _sleep(self):
+    if self.rps and self.rps>0:
+      time.sleep(1.0/float(self.rps))
+
+  def build_url(self, endpoint: str, params: Dict[str, Any]) -> str:
+    params = dict(params)
+    params["api_key"] = self.api_key
+    if self.mailto:
+      params["mailto"] = self.mailto
+    return BASE + endpoint + "?" + urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+
+  def get_json(self, url: str, log_fp=None) -> Dict[str,Any]:
+    last=None
+    for attempt in range(self.max_retries):
+      try:
+        self._sleep()
+        self.request_count += 1
+        req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+          data = resp.read()
+        return json.loads(data.decode("utf-8"))
+      except urllib.error.HTTPError as e:
+        last=e
+        wait=min(40, 2**attempt)
+        if log_fp: log(log_fp, f"[WARN] HTTP {e.code} {e.reason}; retry {wait}s; url={url}")
+        time.sleep(wait)
+      except Exception as e:
+        last=e
+        wait=min(40, 2**attempt)
+        if log_fp: log(log_fp, f"[WARN] NET {type(e).__name__}: {e}; retry {wait}s; url={url}")
+        time.sleep(wait)
+    raise RuntimeError(f"HTTP failed after retries: {last}")
+
+  def list_works(self, search: Optional[str], filter_parts: List[str], sort: str, per_page: int, max_pages: int, select_fields: str, log_fp=None) -> Iterable[Dict[str,Any]]:
+    cursor="*"; pages=0
+    while cursor and pages < max_pages:
+      pages += 1
+      params={"per-page":str(min(max(per_page,1),200)), "cursor":cursor}
+      if search: params["search"]=search
+      if filter_parts: params["filter"]=",".join(filter_parts)
+      if sort: params["sort"]=sort
+      if select_fields: params["select"]=select_fields
+      url = self.build_url("/works", params)
+      j = self.get_json(url, log_fp=log_fp)
+      res = j.get("results") or []
+      cursor = (j.get("meta") or {}).get("next_cursor")
+      if not res: break
+      for w in res: yield w
+
+  def search_topics(self, term: str, k: int = 5, log_fp=None) -> List[Dict[str,Any]]:
+    term = sanitize_query(term)
+    if not term: return []
+    params={"search":term, "per-page":str(min(k,25)), "select":"id,display_name,description,subfield,field,domain"}
+    url = self.build_url("/topics", params)
+    j = self.get_json(url, log_fp=log_fp)
+    return j.get("results") or []
+
+def extract_authors(w: Dict[str,Any], n: int = 25) -> str:
+  out=[]
+  for a in (w.get("authorships") or [])[:n]:
+    dn = ((a or {}).get("author") or {}).get("display_name")
+    if dn: out.append(dn)
+  return "; ".join(out)
+
+def extract_venue(w: Dict[str,Any]) -> str:
+  pl = w.get("primary_location") or {}
+  src = pl.get("source") or {}
+  return (src.get("display_name") or "")
+
+def extract_topics(w: Dict[str,Any]) -> str:
+  ts = w.get("topics") or []
+  names=[]
+  for t in ts[:3]:
+    nm = (t or {}).get("display_name") or ""
+    if nm: names.append(nm)
+  return "; ".join(names)
+
+def extract_concepts(w: Dict[str,Any]) -> str:
+  cs = w.get("concepts") or []
+  # pick top by score if present
+  try:
+    cs = sorted(cs, key=lambda c: (c or {}).get("score",0), reverse=True)
+  except Exception:
+    pass
+  names=[]
+  for c in cs[:8]:
+    nm = (c or {}).get("display_name") or ""
+    if nm: names.append(nm)
+  return "; ".join(names)
+
+def primary_topic_id(w: Dict[str,Any]) -> str:
+  pt = w.get("primary_topic") or {}
+  tid = pt.get("id") or ""
+  m = re.search(r"/(T\d+)$", tid)
+  return m.group(1) if m else ""
+
+def make_row(w: Dict[str,Any], source: str) -> Dict[str,Any]:
+  oid = normalize_id((w.get("id") or w.get("openalex_id") or ""))
+  doi = (w.get("doi") or "").replace("https://doi.org/","").strip()
+  title = (w.get("title") or w.get("display_name") or "").strip()
+  year = w.get("publication_year") or ""
+  wtype = w.get("type") or ""
+  venue = extract_venue(w)
+  authors = extract_authors(w)
+  cited = int(w.get("cited_by_count") or 0)
+  lang = (w.get("language") or "").lower()
+  top_topics = extract_topics(w)
+  top_concepts = extract_concepts(w)
+  abstract = reconstruct_abstract(w.get("abstract_inverted_index") or {})
+  return {"source":source,"openalex_id":oid,"doi":doi,"title":title,"year":year,"type":wtype,"venue":venue,"authors":authors,"cited_by":cited,"language":lang,"top_topics":top_topics,"top_concepts":top_concepts,"abstract":abstract}
+
+def save_csv(path: str, rows: List[Dict[str,Any]]) -> None:
+  with open(path,"w",newline="",encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=CSV_COLS)
+    w.writeheader()
+    for r in rows:
+      w.writerow({k:r.get(k,"") for k in CSV_COLS})
+
+def input_blob(idea_dir: str) -> str:
+  out_dir = os.path.join(idea_dir,"out")
+  parts=[]
+  parts.append(read_text(os.path.join(out_dir,"structured_idea.json")))
+  parts.append(read_text(os.path.join(idea_dir,"idea.txt")))
+  parts.append(read_text(os.path.join(idea_dir,"in","idea.txt")))
+  blob = "\n".join([p for p in parts if p and p.strip()])
+  return blob
+
+def sha256(s: str) -> str:
+  return hashlib.sha256((s or "").encode("utf-8",errors="ignore")).hexdigest()
+
+def harvest_phase(client: OAClient, log_fp, name: str, queries: List[str], filter_parts: List[str], sort: str,
+                  target_n: int, per_page: int, max_pages_per_query: int,
+                  require_doi: bool, prefer_langs: Optional[Set[str]],
+                  seen: Set[str], rows: List[Dict[str,Any]], request_cap: int, select_fields: str) -> Dict[str,Any]:
+  phase={"name":name,"queries":[],"kept_start":len(rows),"kept_end":None,"requests_start":client.request_count,"requests_end":None}
+  for q in queries:
+    if len(rows) >= target_n: break
+    if client.request_count >= request_cap:
+      log(log_fp, f"[WARN] request_cap reached ({request_cap}); stop phase {name}")
+      break
+    kept=0; seen_count=0
+    for w in client.list_works(search=q, filter_parts=filter_parts, sort=sort, per_page=per_page, max_pages=max_pages_per_query, select_fields=select_fields, log_fp=log_fp):
+      oid = normalize_id(w.get("id",""))
+      if not oid or oid in seen: continue
+      seen.add(oid); seen_count += 1
+      row = make_row(w, source=name)
+      if require_doi and not row["doi"]: continue
+      if prefer_langs and row["language"] and row["language"] not in prefer_langs: continue
+      rows.append(row); kept += 1
+      if len(rows) >= target_n: break
+    phase["queries"].append({"query":q,"pages":max_pages_per_query,"collected_seen":seen_count,"kept":kept})
+    log(log_fp, f"[INFO] [{name}] q='{q}' kept={kept} collected_seen={seen_count}")
+  phase["kept_end"]=len(rows); phase["requests_end"]=client.request_count
+  return phase
+
+def main() -> int:
+  ap = argparse.ArgumentParser()
+  ap.add_argument("--idea-dir", required=True)
+  ap.add_argument("--n", type=int, default=300)
+  ap.add_argument("--from-year", type=int, default=1990)
+  ap.add_argument("--to-year", type=int, default=2100)
+  ap.add_argument("--scope", choices=["balanced","wide","focused"], default="balanced")
+  ap.add_argument("--rps", type=float, default=2.0)
+  ap.add_argument("--request-cap", type=int, default=200)
+  ap.add_argument("--prefer-lang", type=str, default="en,ru")
+  ap.add_argument("--keep-no-doi", action="store_true")
+  ap.add_argument("--fresh", action="store_true")
+  ap.add_argument("--min-keep", type=int, default=50)
+  args = ap.parse_args()
+
+  idea_dir = os.path.abspath(args.idea_dir)
+  out_dir = os.path.join(idea_dir,"out")
+  os.makedirs(out_dir, exist_ok=True)
+
+  log_path = os.path.join(out_dir,"module_B.log")
+  with open(log_path,"a",encoding="utf-8") as log_fp:
+    log(log_fp, f"Stage B {VERSION} started UTC={utc_now()} scope={args.scope} target={args.n}")
+
+    root_dir = os.path.abspath(os.path.join(idea_dir,"..",".."))
+    api_key, mailto = get_api_key(root_dir)
+    if not api_key:
+      log(log_fp, "[ERR] OPENALEX_API_KEY not found in config/secrets.env or env var.")
+      return 2
+
+    blob = input_blob(idea_dir)
+    if not blob.strip():
+      log(log_fp, "[ERR] No input text: need out/structured_idea.json and/or idea.txt")
+      return 2
+    ih = sha256(blob)
+
+    ckpt_path = os.path.join(out_dir,"_moduleB_checkpoint.json")
+    state=None
+    if os.path.exists(ckpt_path) and not args.fresh:
+      try:
+        state = json.load(open(ckpt_path,"r",encoding="utf-8"))
+      except Exception:
+        state=None
+
+    # checkpoint validity
+    if state:
+      ok = True
+      if state.get("version") != VERSION: ok = False
+      if state.get("input_hash") != ih: ok = False
+      if state.get("scope") != args.scope: ok = False
+      if int(state.get("target_n",0) or 0) != int(args.n): ok = False
+      if not state.get("phases"): ok = False
+      if ok:
+        rows = state.get("rows",[]) or []
+        if len(rows) >= max(args.min_keep, min(args.n, 50)):
+          log(log_fp, f"[INFO] Using valid checkpoint rows={len(rows)}")
+          # still rewrite outputs for consistency
+          save_csv(os.path.join(out_dir,"corpus.csv"), rows[:args.n])
+          with open(os.path.join(out_dir,"search_log.json"),"w",encoding="utf-8") as f:
+            json.dump(state.get("search_log",{}), f, ensure_ascii=False, indent=2)
+          return 0
+      log(log_fp, "[INFO] Checkpoint ignored (version/input/scope mismatch or empty).")
+
+    prefer_langs=set([x.strip().lower() for x in args.prefer_lang.split(",") if x.strip()]) if args.prefer_lang else None
+    require_doi = not bool(args.keep_no_doi)
+
+    client = OAClient(api_key=api_key, mailto=mailto, rps=float(args.rps), user_agent="IdeaPipeline-StageB/v7.3")
+    queries = build_queries(blob)
+    log(log_fp, "[INFO] Queries: " + " | ".join(queries))
+
+    # topic gate: search Topics by top terms (prevents drift)
+    topic_terms=[]
+    topic_terms += find_binomials(blob, limit=2)
+    topic_terms += [t for t in rank_terms(blob, max_terms=10) if not has_cyr(t)]
+    topic_terms += ["landscape genomics","riverscape genetics","genotype environment association"]
+    topic_terms = [sanitize_query(t) for t in topic_terms if t]
+    # unique
+    seenT=set(); topic_terms_u=[]
+    for t in topic_terms:
+      if t not in seenT:
+        topic_terms_u.append(t); seenT.add(t)
+      if len(topic_terms_u)>=8: break
+
+    topic_gate_ids=[]
+    topic_gate_names={}
+    for t in topic_terms_u:
+      try:
+        res = client.search_topics(t, k=5, log_fp=log_fp)
+        if res:
+          tid = (res[0].get("id") or "")
+          m = re.search(r"/(T\d+)$", tid)
+          if m:
+            tid2 = m.group(1)
+            if tid2 not in topic_gate_ids:
+              topic_gate_ids.append(tid2)
+              topic_gate_names[tid2] = res[0].get("display_name","")
+      except Exception as e:
+        log(log_fp, f"[WARN] topics search failed for '{t}': {e}")
+      if len(topic_gate_ids) >= 8: break
+
+    if topic_gate_ids:
+      log(log_fp, "[INFO] Topic-gate IDs: " + ", ".join(topic_gate_ids))
+
+    year_filter = f"publication_year:{int(args.from_year)}-{int(args.to_year)}"
+    if args.scope == "wide":
+      type_filter = "type:article|review|preprint|book-chapter"
+    else:
+      type_filter = "type:article|review"
+
+    base_filters=[year_filter, type_filter]
+
+    # apply gate if exists
+    gate_filter=None
+    if topic_gate_ids:
+      gate_filter = "primary_topic.id:" + "|".join(topic_gate_ids)
+    filters_probe = base_filters + ([gate_filter] if gate_filter else [])
+
+    select_fields=",".join([
+      "id","doi","title","display_name","publication_year","type","cited_by_count","language",
+      "authorships","primary_location","abstract_inverted_index","concepts","topics","primary_topic"
+    ])
+
+    rows=[]; seen=set()
+    phases=[]
+    request_cap=int(args.request_cap)
+
+    # Phase 1: probe relevance
+    phases.append(harvest_phase(
+      client, log_fp, "probe_relevance",
+      queries=queries[:10], filter_parts=filters_probe, sort="relevance_score:desc",
+      target_n=min(int(args.n), 140), per_page=200, max_pages_per_query=2,
+      require_doi=require_doi, prefer_langs=prefer_langs,
+      seen=seen, rows=rows, request_cap=request_cap, select_fields=select_fields
+    ))
+
+    # refine gate from actual results (only if results exist)
+    if rows:
+      freq={}
+      for r in rows:
+        # we need primary_topic id from stored row? We didn't store it, so recompute from title search is hard.
+        # Instead: keep precomputed gate; it's already anchored by /topics search.
+        pass
+
+    # Phase 2: recent fill
+    if len(rows) < int(args.n) and client.request_count < request_cap:
+      phases.append(harvest_phase(
+        client, log_fp, "fill_recent",
+        queries=queries[:12], filter_parts=filters_probe, sort="publication_date:desc",
+        target_n=int(args.n), per_page=200, max_pages_per_query=3,
+        require_doi=require_doi, prefer_langs=prefer_langs,
+        seen=seen, rows=rows, request_cap=request_cap, select_fields=select_fields
+      ))
+
+    # Phase 3: foundational (highly cited)
+    if len(rows) < int(args.n) and client.request_count < request_cap:
+      phases.append(harvest_phase(
+        client, log_fp, "fill_foundational",
+        queries=queries[:12], filter_parts=filters_probe, sort="cited_by_count:desc",
+        target_n=int(args.n), per_page=200, max_pages_per_query=3,
+        require_doi=require_doi, prefer_langs=prefer_langs,
+        seen=seen, rows=rows, request_cap=request_cap, select_fields=select_fields
+      ))
+
+    # If still tiny -> relax gate (but keep good queries)
+    if len(rows) < max(args.min_keep, min(int(args.n), 50)) and topic_gate_ids and client.request_count < request_cap:
+      log(log_fp, "[WARN] Too few works with topic gate; relaxing gate and retrying focused fill...")
+      phases.append(harvest_phase(
+        client, log_fp, "relaxed_fill",
+        queries=queries[:12], filter_parts=base_filters, sort="relevance_score:desc",
+        target_n=max(int(args.n), 200), per_page=200, max_pages_per_query=3,
+        require_doi=require_doi, prefer_langs=prefer_langs,
+        seen=seen, rows=rows, request_cap=request_cap, select_fields=select_fields
+      ))
+
+    # write outputs
+    rows_sorted = sorted(rows, key=lambda r: (-int(r.get("cited_by") or 0), str(r.get("year") or "")))
+    save_csv(os.path.join(out_dir,"corpus.csv"), rows_sorted[:int(args.n)])
+
+    search_log = {
+      "module":"B","source":"OpenAlex","version":VERSION,
+      "datetime_utc":utc_now(),
+      "target_n":int(args.n),
+      "kept_unique":len(rows_sorted[:int(args.n)]),
+      "scope":args.scope,
+      "request_cap":request_cap,
+      "requests_used":client.request_count,
+      "year_filter":year_filter,
+      "type_filter":type_filter,
+      "queries":queries,
+      "phases":phases,
+      "topic_gate_ids":[f"https://openalex.org/{t}" for t in topic_gate_ids],
+      "topic_gate_names":{f"https://openalex.org/{k}":v for k,v in topic_gate_names.items()}
+    }
+    with open(os.path.join(out_dir,"search_log.json"),"w",encoding="utf-8") as f:
+      json.dump(search_log, f, ensure_ascii=False, indent=2)
+
+    with open(os.path.join(out_dir,"field_map.md"),"w",encoding="utf-8") as f:
+      f.write("# Field map (Stage B)\n\n")
+      f.write(f"- Scope: **{args.scope}**\n")
+      f.write(f"- Total kept: **{len(rows_sorted[:int(args.n)])}** (target {int(args.n)})\n")
+      f.write(f"- Requests used: **{client.request_count}** (cap {request_cap})\n")
+      f.write(f"- Year filter: `{year_filter}`\n")
+      f.write(f"- Type filter: `{type_filter}`\n\n")
+      if topic_gate_ids:
+        f.write("## Topic gate (from /topics search)\n")
+        for tid in topic_gate_ids:
+          name = topic_gate_names.get(tid,"")
+          f.write(f"- {name} (https://openalex.org/{tid})\n")
+
+    with open(os.path.join(out_dir,"prisma_lite.md"),"w",encoding="utf-8") as f:
+      f.write("# PRISMA-lite (Stage B)\n\n")
+      f.write(f"- Source: OpenAlex API\n")
+      f.write(f"- Date (UTC): {utc_now()}\n")
+      f.write(f"- Scope: {args.scope}\n")
+      f.write(f"- Target N: {int(args.n)}\n")
+      f.write(f"- Included: {len(rows_sorted[:int(args.n)])}\n")
+      f.write(f"- Requests used: {client.request_count}\n")
+
+    # checkpoint (safe)
+    ckpt = {
+      "version":VERSION,"input_hash":ih,"scope":args.scope,"target_n":int(args.n),
+      "rows":rows_sorted[:int(args.n)],
+      "phases":phases,
+      "search_log":search_log
+    }
+    with open(os.path.join(out_dir,"_moduleB_checkpoint.json"),"w",encoding="utf-8") as f:
+      json.dump(ckpt, f, ensure_ascii=False, indent=2)
+
+    # quality gate
+    if len(rows_sorted) < int(args.min_keep):
+      log(log_fp, f"[ERR] Too few works collected: {len(rows_sorted)} < min_keep={args.min_keep}")
+      return 3
+
+    log(log_fp, "[OK] Stage B done.")
+    return 0
+
+if __name__ == "__main__":
+  try:
+    raise SystemExit(main())
+  except SystemExit:
+    raise
+  except Exception as e:
+    sys.stderr.write(f"[FATAL] {type(e).__name__}: {e}\n")
+    raise SystemExit(1)

@@ -1,0 +1,8 @@
+﻿
+[INFO] ROOT=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2
+[INFO] IDEA_DIR=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\ideas\IDEA-20260223-001
+[INFO] SCOPE=balanced
+[INFO] N=300
+[INFO] LOG=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\launcher_logs\runB_20260223_201216.log
+[INFO] PY=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\.venv\Scripts\python.exe
+[INFO] CMD: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\.venv\Scripts\python.exe D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\tools\b_lit_scout.py --idea-dir D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2\ideas\IDEA-20260223-001 --n 300 --scope balanced

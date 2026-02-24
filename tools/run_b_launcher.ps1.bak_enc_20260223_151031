@@ -1,0 +1,81 @@
+param(
+  [ValidateSet('balanced','wide','focused')]
+  [string]$Scope = 'balanced',
+  [string]$IdeaArg = '',
+  [int]$N = 300
+)
+
+# --- Encoding / Unicode safety ---
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try { chcp 65001 | Out-Null } catch {}
+# ---------------------------------
+
+$ErrorActionPreference = 'Stop'
+
+$toolsDir = $PSScriptRoot
+$root = Split-Path -Parent $toolsDir
+
+Write-Output ("[INFO] PS_ROOT=" + $root)
+Write-Output ("[INFO] SCOPE=" + $Scope)
+
+$ideasDir = Join-Path $root 'ideas'
+if (-not (Test-Path $ideasDir)) { throw "Missing folder: $ideasDir" }
+
+function Resolve-IdeaDir([string]$arg) {
+  if ($arg -and $arg.Trim()) {
+    $p = $arg
+    if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $root $p }
+    $p = [IO.Path]::GetFullPath($p)
+    if ((Split-Path -Leaf $p) -ieq 'out') { $p = Split-Path -Parent $p }
+    return $p
+  }
+
+  $cands = Get-ChildItem $ideasDir -Directory | Where-Object { $_.Name -like 'IDEA-*' } | Sort-Object Name -Descending
+  $withA = $cands | Where-Object { Test-Path (Join-Path $_.FullName 'out\structured_idea.json') } | Select-Object -First 1
+  if ($withA) { return $withA.FullName }
+  $first = $cands | Select-Object -First 1
+  if ($first) { return $first.FullName }
+  throw "No IDEA-* folder found in $ideasDir"
+}
+
+$ideaDir = Resolve-IdeaDir $IdeaArg
+Write-Output ("[INFO] IDEA_DIR=" + $ideaDir)
+
+$inJson = Join-Path $ideaDir 'out\structured_idea.json'
+if (-not (Test-Path $inJson)) { throw ("Missing input: " + $inJson) }
+
+# --- auto-fresh when mode changes (or old logs without scope)
+$outDir = Join-Path $ideaDir 'out'
+$ckpt = Join-Path $outDir '_moduleB_checkpoint.json'
+$searchLog = Join-Path $outDir 'search_log.json'
+
+$lastScope = ''
+if (Test-Path $searchLog) {
+  try {
+    $sl = Get-Content $searchLog -Raw | ConvertFrom-Json
+    if ($sl.PSObject.Properties.Name -contains 'scope') { $lastScope = [string]$sl.scope }
+  } catch { }
+}
+
+if ($lastScope -and ($lastScope -ne $Scope)) {
+  Write-Output ("[INFO] Scope changed: " + $lastScope + " -> " + $Scope + " ; deleting checkpoint for fresh run")
+  Remove-Item -Force -Path $ckpt -ErrorAction SilentlyContinue
+} elseif ((-not $lastScope) -and ($Scope -ne 'balanced')) {
+  Write-Output ("[INFO] No scope in search_log.json; for WIDE/FOCUSED do fresh run (delete checkpoint)")
+  Remove-Item -Force -Path $ckpt -ErrorAction SilentlyContinue
+} else {
+  Write-Output ("[INFO] Using existing checkpoint (if any). LastScope=" + $lastScope)
+}
+
+$script = Join-Path $root 'tools\b_lit_scout.py'
+if (-not (Test-Path $script)) { throw ("Missing script: " + $script) }
+
+$py = Join-Path $root '.venv\Scripts\python.exe'
+if (-not (Test-Path $py)) { $py = 'python' }
+
+Write-Output ("[INFO] PY=" + $py)
+Write-Output ("[INFO] RUN=" + $py + " " + $script + " --idea-dir " + $ideaDir + " --n " + $N + " --scope " + $Scope)
+
+& $py $script --idea-dir $ideaDir --n $N --scope $Scope
+exit $LASTEXITCODE
