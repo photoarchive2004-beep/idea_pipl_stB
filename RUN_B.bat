@@ -4,16 +4,16 @@ set "ROOT=%~dp0"
 cd /d "%ROOT%"
 
 echo ===================================
-echo   STAGE B - Literature Scout (OpenAlex)
+echo   STAGE B - Мульти-источниковый поиск литературы
 echo ===================================
 echo.
-echo Choose mode:
-echo   1) BALANCED (default)
+echo Выберите режим:
+echo   1) BALANCED (по умолчанию)
 echo   2) WIDE
 echo   3) FOCUSED
 echo.
 set "CH=1"
-set /p CH=Enter 1/2/3 (empty = 1): 
+set /p CH=Введите 1/2/3 (пусто = 1): 
 if "!CH!"=="" set "CH=1"
 
 set "SCOPE=balanced"
@@ -21,11 +21,11 @@ if "!CH!"=="2" set "SCOPE=wide"
 if "!CH!"=="3" set "SCOPE=focused"
 
 echo.
-echo [INFO] SCOPE=!SCOPE!
+echo [INFO] РЕЖИМ=!SCOPE!
 echo.
 
 if not exist "%ROOT%tools\run_b_launcher.ps1" (
-  echo [ERR] Missing tools\run_b_launcher.ps1
+  echo [ERR] Не найден tools\run_b_launcher.ps1
   pause
   exit /b 1
 )
@@ -35,10 +35,19 @@ set "RC=%ERRORLEVEL%"
 
 echo.
 if "!RC!"=="0" (
-  echo [OK] Stage B finished successfully.
+  echo [OK] Stage B завершён.
 ) else (
-  echo [ERR] Stage B failed. ExitCode=!RC!
-  echo [HINT] See launcher_logs\LAST_LOG.txt and idea out\module_B.log / search_log.json
+  echo [ERR] Stage B завершился с ошибкой. ExitCode=!RC!
+  echo [HINT] См. launcher_logs\LAST_LOG.txt и out\stageB_summary.txt
+)
+
+for /f "delims=" %%i in ('type "ideas\_ACTIVE_PATH.txt" 2^>nul') do set "ACTIVE_IDEA=%%i"
+if defined ACTIVE_IDEA (
+  if exist "!ACTIVE_IDEA!\out\stageB_summary.txt" (
+    echo.
+    echo ===== Сводка Stage B =====
+    type "!ACTIVE_IDEA!\out\stageB_summary.txt"
+  )
 )
 echo.
 pause
