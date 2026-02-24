@@ -2,6 +2,9 @@
 setlocal EnableExtensions EnableDelayedExpansion
 set "ROOT=%~dp0"
 cd /d "%ROOT%"
+chcp 65001 >nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 
 echo ===================================
 echo   STAGE B - Мульти-источниковый поиск литературы
@@ -30,7 +33,7 @@ if not exist "%ROOT%tools\run_b_launcher.ps1" (
   exit /b 1
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\run_b_launcher.ps1" -Scope "!SCOPE!" -N 300 -NoPause
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%tools\run_b_launcher.ps1" -Scope "!SCOPE!" -N 300
 set "RC=%ERRORLEVEL%"
 
 echo.
@@ -41,14 +44,6 @@ if "!RC!"=="0" (
   echo [HINT] См. launcher_logs\LAST_LOG.txt и out\stageB_summary.txt
 )
 
-for /f "delims=" %%i in ('type "ideas\_ACTIVE_PATH.txt" 2^>nul') do set "ACTIVE_IDEA=%%i"
-if defined ACTIVE_IDEA (
-  if exist "!ACTIVE_IDEA!\out\stageB_summary.txt" (
-    echo.
-    echo ===== Сводка Stage B =====
-    type "!ACTIVE_IDEA!\out\stageB_summary.txt"
-  )
-)
 echo.
 pause
 exit /b !RC!
