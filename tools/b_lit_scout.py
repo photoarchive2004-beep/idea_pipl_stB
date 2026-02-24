@@ -29,7 +29,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 BASE = "https://api.openalex.org"
 NCBI_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
-VERSION = "v9.0-multisource"
+VERSION = "v9.1-deep-harvest"
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -165,6 +165,21 @@ class OAClient:
                 break
             for w in res:
                 yield w
+
+    def list_entities(self, endpoint: str, *, search: str, per_page: int = 50, max_pages: int = 1, log_fp=None) -> Iterable[Dict[str, Any]]:
+        cursor = "*"
+        pages = 0
+        while cursor and pages < max_pages:
+            pages += 1
+            params = {"search": search, "per-page": str(min(max(per_page, 1), 200)), "cursor": cursor}
+            url = self.build_url(endpoint, params)
+            j = self.get_json(url, log_fp=log_fp)
+            res = j.get("results") or []
+            cursor = (j.get("meta") or {}).get("next_cursor")
+            if not res:
+                break
+            for item in res:
+                yield item
 
 @dataclass
 class NCBIClient:
@@ -312,9 +327,8 @@ def build_seed_queries(domain: List[str], method: List[str]) -> List[str]:
         dom_group = "(" + " OR ".join(dom_q[:4]) + ")"
     else:
         dom_group = dom_q[0]
-    safe_methods = [quote_term(m) for m in method2[:6]]
-    safe_methods += ["genomics", "phylogeography", "meta analysis", "systematic review",
-                      "causal inference", "network analysis", "time series", "cohort", "benchmark", "simulation"]
+    safe_methods = [quote_term(m) for m in method2[:8]]
+    safe_methods += ["systematic review", "meta analysis", "benchmark", "evaluation", "longitudinal study"]
     seen=set(); mp=[]
     for x in safe_methods:
         k=x.lower()
@@ -475,9 +489,43 @@ def build_anchor_set(domain_terms: List[str], method_terms: List[str]) -> Set[st
         if x.lower() in GENERIC_METHOD:
             continue
         a.add(x.lower())
-    for x in ["genomics","phylogeography","population","introgression","demography","connectivity","gene flow","geographic","systematic review","meta analysis"]:
+    for x in ["systematic review", "meta analysis", "benchmark", "evidence", "dataset", "experimental"]:
         a.add(x.lower())
     return a
+
+def count_csv_rows(path: str) -> int:
+    if not os.path.exists(path):
+        return 0
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return max(0, sum(1 for _ in f) - 1)
+
+def write_stage_summary(path: str, *, status: str, started_utc: str, source_stats: Dict[str, int],
+                        dedup_total: int, corpus_path: str, corpus_all_path: str,
+                        errors: List[str], search_log_path: str, module_log_path: str,
+                        checkpoint_path: str, requests: Dict[str, int]) -> str:
+    lines = [
+        "=== Сводка Stage B ===",
+        f"Статус: {status}",
+        f"Время (UTC): старт {started_utc}",
+        f"Добавлено OpenAlex: {int(source_stats.get('openalex', 0))}",
+        f"Добавлено NCBI: {int(source_stats.get('ncbi', 0))}",
+        f"Дедуп (уникальных ключей): {dedup_total}",
+        f"Итог corpus.csv: {count_csv_rows(corpus_path)} записей",
+        f"Итог corpus_all.csv: {count_csv_rows(corpus_all_path)} записей",
+        f"Запросов OpenAlex: {int(requests.get('openalex', 0))}",
+        f"Запросов NCBI: {int(requests.get('ncbi', 0))}",
+        f"Файл корпуса: {corpus_path}",
+        f"Файл полного корпуса: {corpus_all_path}",
+        f"Лог поиска: {search_log_path}",
+        f"Лог модуля: {module_log_path}",
+        f"Чекпоинт: {checkpoint_path}",
+    ]
+    if errors:
+        lines.append("Причины деградации/ошибки: " + " | ".join(errors[:3]))
+    text = "\n".join(lines[:20]) + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return text
 
 def score_row(r: Dict[str,Any], anchors: Set[str]) -> int:
     text = " ".join([r.get("title",""), r.get("abstract",""), r.get("topics",""), r.get("concepts","")]).lower()
@@ -536,232 +584,349 @@ def main() -> int:
     ap.add_argument("--min-anchor-hit", type=float, default=0.20)
     args = ap.parse_args()
 
-    idea_dir=os.path.abspath(args.idea_dir)
-    out_dir=os.path.join(idea_dir,"out")
+    idea_dir = os.path.abspath(args.idea_dir)
+    out_dir = os.path.join(idea_dir, "out")
     os.makedirs(out_dir, exist_ok=True)
 
-    log_path=os.path.join(out_dir,"module_B.log")
-    root_dir=os.path.abspath(os.path.join(idea_dir,"..",".."))
+    started_utc = utc_now()
+    status = "OK"
+    errors: List[str] = []
+    phases: List[Dict[str, Any]] = []
+    source_stats = {"openalex": 0, "ncbi": 0}
+    rows_all: List[Dict[str, Any]] = []
+    dedup_seen: Set[str] = set()
+    oa_requests = 0
+    ncbi_requests = 0
+    seed_queries: List[str] = []
+    domain_terms: List[str] = []
+    method_terms: List[str] = []
+    tgate: List[str] = []
+    cgate: List[str] = []
+    dom_gate = ""
+    dom_share = 0.0
+    dom_cnt: Dict[str, int] = {}
+
+    log_path = os.path.join(out_dir, "module_B.log")
+    root_dir = os.path.abspath(os.path.join(idea_dir, "..", ".."))
     api_key, mailto, ncbi_key = get_api_key(root_dir)
+    search_log_path = os.path.join(out_dir, "search_log.json")
+    summary_path = os.path.join(out_dir, "stageB_summary.txt")
+    corpus_path = os.path.join(out_dir, "corpus.csv")
+    corpus_all_path = os.path.join(out_dir, "corpus_all.csv")
+    ckpt_path = os.path.join(out_dir, "_moduleB_checkpoint.json")
 
-    with open(log_path,"a",encoding="utf-8") as L:
-        log(L, f"Stage B {VERSION} старт UTC={utc_now()} scope={args.scope} target={args.n}")
-        blob = input_blob(idea_dir)
-        if not blob.strip():
-            log(L, "[ERR] Нет входного текста")
-            return 2
+    def add_row(r: Dict[str, Any]) -> bool:
+        k = dedup_key(r)
+        if k in dedup_seen:
+            return False
+        dedup_seen.add(k)
+        rows_all.append(r)
+        src = "ncbi" if "ncbi" in str(r.get("source", "")).lower() else "openalex"
+        source_stats[src] = source_stats.get(src, 0) + 1
+        return True
 
-        status = "OK"
-        errors = []
-        ih = sha256(blob)
-        ckpt_path=os.path.join(out_dir,"_moduleB_checkpoint.json")
-        if os.path.exists(ckpt_path) and not args.fresh:
-            try:
-                ck=json.load(open(ckpt_path,"r",encoding="utf-8"))
-                if ck.get("version")==VERSION and ck.get("input_hash")==ih and ck.get("scope")==args.scope and int(ck.get("target_n",0))==int(args.n):
-                    rows = ck.get("rows_doi",[]) or []
-                    if len(rows) >= min(int(args.n), max(50,int(args.min_keep))):
-                        log(L, f"[INFO] Использован checkpoint rows_doi={len(rows)}")
-                        return 0
-            except Exception:
-                pass
+    def strip(rs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out = []
+        for r in rs:
+            rr = dict(r)
+            rr.pop("_score", None)
+            rr.pop("_topic_ids", None)
+            out.append(rr)
+        return out
 
-        rows_all=[]
-        dedup_seen=set()
-        phases=[]
-        source_stats={"openalex":0,"ncbi":0}
+    with open(log_path, "a", encoding="utf-8") as L:
+        log(L, f"Stage B {VERSION} старт UTC={started_utc} scope={args.scope} target={args.n}")
+        try:
+            blob = input_blob(idea_dir)
+            if not blob.strip():
+                status = "FAILED"
+                errors.append("Нет входного текста")
+                raise RuntimeError("Нет входного текста")
 
-        def add_row(r: Dict[str,Any]) -> bool:
-            k = dedup_key(r)
-            if k in dedup_seen:
-                return False
-            dedup_seen.add(k)
-            rows_all.append(r)
-            src = "ncbi" if "ncbi" in str(r.get("source","")).lower() else "openalex"
-            source_stats[src] = source_stats.get(src, 0) + 1
-            return True
+            ih = sha256(blob)
+            if os.path.exists(ckpt_path) and not args.fresh:
+                try:
+                    ck = json.load(open(ckpt_path, "r", encoding="utf-8"))
+                    if ck.get("version") == VERSION and ck.get("input_hash") == ih and ck.get("scope") == args.scope and int(ck.get("target_n", 0)) == int(args.n):
+                        rows = ck.get("rows_doi", []) or []
+                        if len(rows) >= min(int(args.n), max(50, int(args.min_keep))):
+                            log(L, f"[INFO] Использован checkpoint rows_doi={len(rows)}")
+                except Exception as e:
+                    log(L, f"[WARN] Ошибка чтения checkpoint: {e}")
 
-        domain_terms=[]
-        method_terms=[]
-        tgate=[]
-        dom_gate=""
-        dom_share=0.0
-        dom_cnt={}
-        oa_requests=0
-        ncbi_requests=0
-        seed_queries=[]
+            if api_key:
+                try:
+                    client = OAClient(api_key=api_key, mailto=mailto, rps=float(args.rps), user_agent="IdeaPipeline-StageB/v9.1")
+                    binom = find_binomials(blob, limit=10)
+                    terms = rank_terms(blob, max_terms=80)
+                    domain_terms, method_terms = split_domain_method(terms, binom)
+                    seed_queries = build_seed_queries(domain_terms, method_terms)[:25]
 
-        if api_key:
-            try:
-                client = OAClient(api_key=api_key, mailto=mailto, rps=float(args.rps), user_agent="IdeaPipeline-StageB/v9.0")
-                binom = find_binomials(blob, limit=8)
-                terms = rank_terms(blob, max_terms=60)
-                domain_terms, method_terms = split_domain_method(terms, binom)
-                seed_queries = build_seed_queries(domain_terms, method_terms)
-                seed_queries = seed_queries[:20]
+                    year_filter = f"publication_year:{int(args.from_year)}-{int(args.to_year)}"
+                    type_filter = "type:article|review"
+                    if args.scope == "wide":
+                        type_filter = "type:article|review|preprint|book-chapter"
+                    base_filters = [year_filter, type_filter]
+                    select_fields = ",".join([
+                        "id","doi","title","display_name","publication_year","publication_date","type","cited_by_count","language",
+                        "authorships","primary_location","abstract_inverted_index","topics","concepts","primary_topic"
+                    ])
 
-                year_filter = f"publication_year:{int(args.from_year)}-{int(args.to_year)}"
-                type_filter = "type:article|review"
-                if args.scope == "wide":
-                    type_filter = "type:article|review|preprint|book-chapter"
-                base_filters=[year_filter, type_filter]
-                select_fields=",".join([
-                    "id","doi","title","display_name","publication_year","publication_date","type","cited_by_count","language",
-                    "authorships","primary_location","abstract_inverted_index","topics","concepts","primary_topic"
-                ])
+                    def capped() -> bool:
+                        return client.request_count >= int(args.request_cap)
 
-                def run_openalex_phase(name: str, queries: List[str], sort: str, pages_each: int):
-                    ph={"phase":name,"source":"openalex","queries":[],"requests_start":client.request_count}
-                    for q in queries:
-                        before = len(rows_all)
-                        collected = 0
-                        for w in client.list_works(search=q, filter_parts=base_filters, sort=sort,
-                                                   per_page=200, max_pages=pages_each, select_fields=select_fields, log_fp=L):
-                            if add_row(row_from_work(w, source=name)):
-                                collected += 1
-                            if len(rows_all) >= int(args.n) * 2:
+                    def run_phase(name: str, queries: List[str], sort: str, pages_each: int):
+                        ph = {"phase": name, "source": "openalex", "queries": [], "requests_start": client.request_count}
+                        total_added = 0
+                        for q in queries:
+                            if capped():
                                 break
-                        ph["queries"].append({"query":q,"added":collected})
-                        if len(rows_all) >= int(args.n) * 2:
-                            break
-                    ph["requests_end"] = client.request_count
-                    ph["added_total"] = len(rows_all) - before
-                    phases.append(ph)
-
-                run_openalex_phase("seed", seed_queries[:6], "relevance_score:desc", 2)
-                dom_id, dom_share, dom_cnt = top_domain(rows_all)
-                if dom_id and dom_share >= 0.40:
-                    dom_gate = dom_id
-                    base_filters.append(f"primary_topic.domain.id:{dom_gate}")
-                tgate = top_topic_ids(rows_all, topk=10)
-                if tgate:
-                    base_filters.append("topics.id:" + "|".join(tgate[:10]))
-
-                harvest_queries = seed_queries[6:18] if len(seed_queries) > 6 else seed_queries[:6]
-                run_openalex_phase("harvest_filter", harvest_queries[:10], "publication_date:desc", 1)
-                run_openalex_phase("harvest_filter", harvest_queries[:10], "cited_by_count:desc", 1)
-
-                seeds_sorted = sorted([r for r in rows_all if r.get("openalex_id")], key=lambda r: -int(r.get("cited_by") or 0))
-                for seed in seeds_sorted[:3]:
-                    wid = seed.get("openalex_id")
-                    for filt in [f"cites:{wid}", f"cited_by:{wid}"]:
-                        ph={"phase":"citation_chase","source":"openalex","filter":filt,"requests_start":client.request_count}
-                        added=0
-                        for w in client.list_works(search=None, filter_parts=base_filters+[filt], sort="cited_by_count:desc",
-                                                   per_page=200, max_pages=1, select_fields=select_fields, log_fp=L):
-                            if add_row(row_from_work(w, source="citation_chase")):
-                                added += 1
+                            added = 0
+                            for w in client.list_works(search=q, filter_parts=base_filters, sort=sort, per_page=200, max_pages=pages_each, select_fields=select_fields, log_fp=L):
+                                if add_row(row_from_work(w, source=name)):
+                                    added += 1
+                            total_added += added
+                            ph["queries"].append({"query": q, "added": added})
+                        ph["added_total"] = total_added
                         ph["requests_end"] = client.request_count
-                        ph["added_total"] = added
                         phases.append(ph)
-                oa_requests = client.request_count
+
+                    run_phase("seed", seed_queries[:10], "relevance_score:desc", 2)
+
+                    topic_candidates = top_topic_ids(rows_all, topk=10)
+                    concept_candidates: List[str] = []
+                    ph_map = {"phase": "topic_or_concept_map", "source": "openalex", "keywords": domain_terms[:8], "requests_start": client.request_count}
+                    for kw in domain_terms[:8]:
+                        if capped():
+                            break
+                        try:
+                            for t in client.list_entities("/topics", search=kw, per_page=3, max_pages=1, log_fp=L):
+                                tid = (t.get("id") or "").replace("https://openalex.org/", "")
+                                if tid and tid not in topic_candidates:
+                                    topic_candidates.append(tid)
+                            for c in client.list_entities("/concepts", search=kw, per_page=3, max_pages=1, log_fp=L):
+                                cid = (c.get("id") or "").replace("https://openalex.org/", "")
+                                if cid and cid not in concept_candidates:
+                                    concept_candidates.append(cid)
+                        except Exception as e:
+                            errors.append(f"OpenAlex map: {type(e).__name__}: {e}")
+                            status = "DEGRADED"
+                    tgate = topic_candidates[:10]
+                    cgate = concept_candidates[:8]
+                    ph_map["topic_ids"] = tgate
+                    ph_map["concept_ids"] = cgate
+                    ph_map["requests_end"] = client.request_count
+                    phases.append(ph_map)
+
+                    dom_id, dom_share, dom_cnt = top_domain(rows_all)
+                    if dom_id and dom_share >= 0.35:
+                        dom_gate = dom_id
+
+                    ph_h = {"phase": "harvest_filter", "source": "openalex", "requests_start": client.request_count, "targets": []}
+                    per_id_pages = 3 if args.scope == "balanced" else 2
+                    for tid in tgate:
+                        if capped():
+                            break
+                        for sort in ["cited_by_count:desc", "publication_date:desc"]:
+                            added = 0
+                            f = [year_filter, type_filter, f"primary_topic.id:{tid}"]
+                            if dom_gate:
+                                f.append(f"primary_topic.domain.id:{dom_gate}")
+                            for w in client.list_works(search=None, filter_parts=f, sort=sort, per_page=200, max_pages=per_id_pages, select_fields=select_fields, log_fp=L):
+                                if add_row(row_from_work(w, source="harvest_filter")):
+                                    added += 1
+                            ph_h["targets"].append({"type": "topic", "id": tid, "sort": sort, "added": added})
+                    for cid in cgate:
+                        if capped():
+                            break
+                        for sort in ["cited_by_count:desc", "publication_date:desc"]:
+                            added = 0
+                            f = [year_filter, type_filter, f"concepts.id:{cid}"]
+                            for w in client.list_works(search=None, filter_parts=f, sort=sort, per_page=200, max_pages=2, select_fields=select_fields, log_fp=L):
+                                if add_row(row_from_work(w, source="harvest_filter")):
+                                    added += 1
+                            ph_h["targets"].append({"type": "concept", "id": cid, "sort": sort, "added": added})
+                    ph_h["requests_end"] = client.request_count
+                    ph_h["added_total"] = sum(t.get("added", 0) for t in ph_h["targets"])
+                    phases.append(ph_h)
+
+                    seeds_sorted = sorted([r for r in rows_all if r.get("openalex_id")], key=lambda r: -int(r.get("cited_by") or 0))
+                    ph_cit = {"phase": "citation_chase", "source": "openalex", "requests_start": client.request_count, "steps": []}
+                    for seed in seeds_sorted[:2]:
+                        if capped():
+                            break
+                        wid = seed.get("openalex_id")
+                        if not wid:
+                            continue
+                        for filt in [f"cites:{wid}", f"cited_by:{wid}"]:
+                            added = 0
+                            for w in client.list_works(search=None, filter_parts=[year_filter, type_filter, filt], sort="cited_by_count:desc", per_page=100, max_pages=1, select_fields=select_fields, log_fp=L):
+                                if add_row(row_from_work(w, source="citation_chase")):
+                                    added += 1
+                            ph_cit["steps"].append({"filter": filt, "added": added})
+                    ph_cit["requests_end"] = client.request_count
+                    ph_cit["added_total"] = sum(s.get("added", 0) for s in ph_cit["steps"])
+                    phases.append(ph_cit)
+
+                    oa_requests = client.request_count
+                    if capped():
+                        status = "DEGRADED"
+                        errors.append("OpenAlex: достигнут лимит request-cap")
+                except Exception as e:
+                    status = "DEGRADED"
+                    errors.append(f"OpenAlex: {type(e).__name__}: {e}")
+                    phases.append({"phase": "seed", "source": "openalex", "status": "error", "reason": str(e)})
+                    phases.append({"phase": "topic_or_concept_map", "source": "openalex", "status": "error", "reason": "пропущено"})
+                    phases.append({"phase": "harvest_filter", "source": "openalex", "status": "error", "reason": "пропущено"})
+                    phases.append({"phase": "citation_chase", "source": "openalex", "status": "error", "reason": "пропущено"})
+            else:
+                status = "DEGRADED"
+                errors.append("OpenAlex: отсутствует OPENALEX_API_KEY")
+                phases.append({"phase": "seed", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
+                phases.append({"phase": "topic_or_concept_map", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
+                phases.append({"phase": "harvest_filter", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
+                phases.append({"phase": "citation_chase", "source": "openalex", "status": "error", "reason": "нет OPENALEX_API_KEY"})
+
+            try:
+                nc = NCBIClient(api_key=ncbi_key, mailto=mailto, rps=float(args.rps))
+                ncbi_terms = (domain_terms[:8] + method_terms[:8]) or rank_terms(blob, max_terms=24)
+                ncbi_terms = [t for t in ncbi_terms if t][:15]
+                queries = []
+                for t in ncbi_terms[:10]:
+                    queries.append(f"{quote_term(t)}[Title/Abstract]")
+                queries.extend(["systematic review[Title/Abstract]", "meta analysis[Title/Abstract]"])
+                uniq_q = []
+                seen = set()
+                for q in queries:
+                    if q not in seen:
+                        uniq_q.append(q)
+                        seen.add(q)
+                uniq_q = uniq_q[:12]
+                ph = {"phase": "ncbi_search", "source": "ncbi", "queries": uniq_q, "requests_start": nc.request_count, "query_stats": []}
+                all_ids: List[str] = []
+                for q in uniq_q:
+                    ids = nc.esearch(q, retmax=120)
+                    ph["query_stats"].append({"query": q, "pmids": len(ids)})
+                    all_ids.extend(ids)
+                uniq_ids = []
+                seen_ids = set()
+                for pid in all_ids:
+                    if pid not in seen_ids:
+                        uniq_ids.append(pid)
+                        seen_ids.add(pid)
+                uniq_ids = uniq_ids[:1200]
+                added = 0
+                for i in range(0, len(uniq_ids), 40):
+                    pack = uniq_ids[i:i+40]
+                    for rec in nc.esummary(pack):
+                        if add_row(row_from_ncbi(rec, source="ncbi_search")):
+                            added += 1
+                ph["requests_end"] = nc.request_count
+                ph["pmids_total"] = len(uniq_ids)
+                ph["added_total"] = added
+                phases.append(ph)
+                ncbi_requests = nc.request_count
+                if len(uniq_q) < 5:
+                    status = "DEGRADED"
+                    errors.append("NCBI: выполнено менее 5 запросов")
             except Exception as e:
                 status = "DEGRADED"
-                errors.append(f"OpenAlex: {type(e).__name__}: {e}")
-                phases.append({"phase":"seed","source":"openalex","status":"error","reason":str(e)})
-                phases.append({"phase":"harvest_filter","source":"openalex","status":"error","reason":"пропущено из-за ошибки seed"})
-        else:
-            status = "DEGRADED"
-            errors.append("OpenAlex: отсутствует OPENALEX_API_KEY")
-            phases.append({"phase":"seed","source":"openalex","status":"error","reason":"нет OPENALEX_API_KEY"})
-            phases.append({"phase":"harvest_filter","source":"openalex","status":"error","reason":"пропущено: нет OPENALEX_API_KEY"})
+                errors.append(f"NCBI: {type(e).__name__}: {e}")
+                phases.append({"phase": "ncbi_search", "source": "ncbi", "status": "error", "reason": str(e)})
 
-        try:
-            nc = NCBIClient(api_key=ncbi_key, mailto=mailto, rps=float(args.rps))
-            ncbi_terms = domain_terms[:5] + method_terms[:5]
-            if not ncbi_terms:
-                ncbi_terms = rank_terms(blob, max_terms=10)[:8]
-            query = "(" + " OR ".join([quote_term(x) for x in ncbi_terms[:8]]) + ")"
-            ph={"phase":"ncbi_search","source":"ncbi","query":query,"requests_start":nc.request_count}
-            ids = nc.esearch(query, retmax=min(120, int(args.n)*2))
-            added = 0
-            for i in range(0, len(ids), 40):
-                pack = ids[i:i+40]
-                for rec in nc.esummary(pack):
-                    if add_row(row_from_ncbi(rec, source="ncbi_search")):
-                        added += 1
-            ph["requests_end"] = nc.request_count
-            ph["pmids"] = len(ids)
-            ph["added_total"] = added
-            phases.append(ph)
-            ncbi_requests = nc.request_count
+            anchors = build_anchor_set(domain_terms, method_terms)
+            for r in rows_all:
+                r["_score"] = score_row(r, anchors)
+            rows_sorted = sorted(rows_all, key=lambda r: (int(r.get("_score") or 0), int(r.get("cited_by") or 0), str(r.get("publication_date") or "")), reverse=True)
+
+            target_n = int(args.n)
+            rows_doi = [r for r in rows_sorted if r.get("doi")]
+            final_rows = rows_doi[:target_n] if len(rows_doi) >= int(args.min_keep) else rows_sorted[:target_n]
+            top100 = final_rows[:100]
+            hit = sum(1 for r in top100 if int(r.get("_score") or 0) >= 2)
+            hit_rate = hit / max(1, len(top100))
+            phases.append({"phase": "final_select", "source": "pipeline", "selected": len(final_rows), "doi_selected": len([r for r in final_rows if r.get('doi')])})
+
+            save_csv(corpus_path, strip(final_rows))
+            save_csv(corpus_all_path, strip(rows_sorted[:max(1500, target_n * 6)]))
+
+            if args.scope == "balanced" and count_csv_rows(corpus_all_path) < 1500:
+                status = "DEGRADED"
+                errors.append("Не удалось набрать 1500+ записей в corpus_all.csv (ограничения API/лимитов)")
+            if len(final_rows) < int(args.min_keep):
+                status = "DEGRADED"
+                errors.append(f"Мало записей: {len(final_rows)} < min_keep={int(args.min_keep)}")
+            if len(top100) >= 50 and hit_rate < float(args.min_anchor_hit):
+                status = "DEGRADED"
+                errors.append(f"Низкая релевантность: {hit_rate:.2f} < {float(args.min_anchor_hit):.2f}")
+
+            search_log = {
+                "module": "B", "version": VERSION, "datetime_utc": utc_now(), "status": status,
+                "target_n": target_n, "kept": len(final_rows), "kept_doi": len([r for r in final_rows if r.get("doi")]),
+                "requests": {"openalex": oa_requests, "ncbi": ncbi_requests},
+                "seed_queries": seed_queries, "domain_terms": domain_terms, "method_terms": method_terms,
+                "domain_gate": dom_gate, "domain_share_seed": dom_share, "domain_counts_seed": dom_cnt,
+                "topic_gate_ids": [f"https://openalex.org/{x}" for x in tgate],
+                "concept_gate_ids": [f"https://openalex.org/{x}" for x in cgate],
+                "quality": {"anchor_hit_rate_top100": hit_rate, "top100_hits_ge2": hit, "anchors_count": len(anchors)},
+                "source_stats": source_stats,
+                "dedup_keys": len(dedup_seen),
+                "errors": errors,
+                "phases": phases,
+            }
+            with open(search_log_path, "w", encoding="utf-8") as f:
+                json.dump(search_log, f, ensure_ascii=False, indent=2)
+
+            with open(os.path.join(out_dir, "field_map.md"), "w", encoding="utf-8") as f:
+                f.write("# Карта поля (Stage B)\n\n")
+                f.write(f"- Версия: {VERSION}\n")
+                f.write(f"- Статус: **{status}**\n")
+                f.write(f"- OpenAlex gate domain: `{dom_gate or 'OFF'}` share={dom_share:.2f}\n")
+                f.write(f"- Top topics gate: {len(tgate)}\n")
+                f.write(f"- Top concepts gate: {len(cgate)}\n")
+
+            with open(os.path.join(out_dir, "prisma_lite.md"), "w", encoding="utf-8") as f:
+                f.write("# PRISMA-lite (Stage B)\n\n")
+                f.write("- Источники: OpenAlex, NCBI\n")
+                f.write(f"- Статус: {status}\n")
+                f.write(f"- Добавлено OpenAlex: {source_stats.get('openalex',0)}\n")
+                f.write(f"- Добавлено NCBI: {source_stats.get('ncbi',0)}\n")
+                f.write(f"- В итоговом корпусе: {len(final_rows)}\n")
+                f.write(f"- В расширенном корпусе: {count_csv_rows(corpus_all_path)}\n")
+
+            ckpt = {"version": VERSION, "input_hash": ih, "scope": args.scope, "target_n": target_n,
+                    "rows_doi": strip(final_rows), "rows_all": strip(rows_sorted[:max(target_n, 1500)]), "search_log": search_log}
+            with open(ckpt_path, "w", encoding="utf-8") as f:
+                json.dump(ckpt, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            status = "DEGRADED"
-            errors.append(f"NCBI: {type(e).__name__}: {e}")
-            phases.append({"phase":"ncbi_search","source":"ncbi","status":"error","reason":str(e)})
+            status = "FAILED" if status == "OK" else status
+            errors.append(f"FATAL: {type(e).__name__}: {e}")
+            log(L, f"[ERR] Необработанная ошибка: {type(e).__name__}: {e}")
+            if not os.path.exists(corpus_path):
+                save_csv(corpus_path, [])
+            if not os.path.exists(corpus_all_path):
+                save_csv(corpus_all_path, [])
+            with open(search_log_path, "w", encoding="utf-8") as f:
+                json.dump({"module": "B", "version": VERSION, "status": status, "errors": errors, "phases": phases}, f, ensure_ascii=False, indent=2)
+        finally:
+            summary_text = write_stage_summary(
+                summary_path,
+                status=status,
+                started_utc=started_utc,
+                source_stats=source_stats,
+                dedup_total=len(dedup_seen),
+                corpus_path=corpus_path,
+                corpus_all_path=corpus_all_path,
+                errors=errors,
+                search_log_path=search_log_path,
+                module_log_path=log_path,
+                checkpoint_path=ckpt_path,
+                requests={"openalex": oa_requests, "ncbi": ncbi_requests},
+            )
+            print(summary_text, end="")
+            log(L, f"[INFO] Финальный статус: {status}")
 
-        anchors = build_anchor_set(domain_terms, method_terms)
-        for r in rows_all:
-            r["_score"] = score_row(r, anchors)
-        rows_sorted = sorted(rows_all, key=lambda r: (int(r.get("_score") or 0), int(r.get("cited_by") or 0), str(r.get("publication_date") or "")), reverse=True)
-
-        target_n = int(args.n)
-        rows_doi = [r for r in rows_sorted if r.get("doi")]
-        final_rows = rows_doi[:target_n] if len(rows_doi) >= int(args.min_keep) else rows_sorted[:target_n]
-        top100 = final_rows[:100]
-        hit = sum(1 for r in top100 if int(r.get("_score") or 0) >= 2)
-        hit_rate = hit / max(1, len(top100))
-        phases.append({"phase":"final_select","source":"pipeline","selected":len(final_rows),"doi_selected":len([r for r in final_rows if r.get('doi')])})
-
-        def strip(rs):
-            out=[]
-            for r in rs:
-                rr=dict(r)
-                rr.pop("_score", None)
-                rr.pop("_topic_ids", None)
-                out.append(rr)
-            return out
-
-        save_csv(os.path.join(out_dir,"corpus.csv"), strip(final_rows))
-
-        search_log = {
-            "module":"B","version":VERSION,"datetime_utc":utc_now(),"status":status,
-            "target_n":target_n,"kept":len(final_rows),"kept_doi":len([r for r in final_rows if r.get("doi")]),
-            "requests":{"openalex":oa_requests,"ncbi":ncbi_requests},
-            "seed_queries":seed_queries,"domain_terms":domain_terms,"method_terms":method_terms,
-            "domain_gate":dom_gate,"domain_share_seed":dom_share,"domain_counts_seed":dom_cnt,
-            "topic_gate_ids":[f"https://openalex.org/{x}" for x in tgate[:10]] if tgate else [],
-            "quality":{"anchor_hit_rate_top100":hit_rate,"top100_hits_ge2":hit,"anchors_count":len(anchors)},
-            "source_stats":source_stats,
-            "dedup_keys":len(dedup_seen),
-            "errors":errors,
-            "phases":phases,
-        }
-        with open(os.path.join(out_dir,"search_log.json"),"w",encoding="utf-8") as f:
-            json.dump(search_log, f, ensure_ascii=False, indent=2)
-
-        with open(os.path.join(out_dir,"field_map.md"),"w",encoding="utf-8") as f:
-            f.write("# Карта поля (Stage B)\n\n")
-            f.write(f"- Версия: {VERSION}\n")
-            f.write(f"- Статус: **{status}**\n")
-            f.write(f"- OpenAlex gate domain: `{dom_gate or 'OFF'}` share={dom_share:.2f}\n")
-            f.write(f"- Top topics gate: {len(tgate[:10]) if tgate else 0}\n")
-
-        with open(os.path.join(out_dir,"prisma_lite.md"),"w",encoding="utf-8") as f:
-            f.write("# PRISMA-lite (Stage B)\n\n")
-            f.write(f"- Источники: OpenAlex, NCBI\n")
-            f.write(f"- Статус: {status}\n")
-            f.write(f"- Добавлено OpenAlex: {source_stats.get('openalex',0)}\n")
-            f.write(f"- Добавлено NCBI: {source_stats.get('ncbi',0)}\n")
-            f.write(f"- В итоговом корпусе: {len(final_rows)}\n")
-
-        ckpt={"version":VERSION,"input_hash":ih,"scope":args.scope,"target_n":target_n,
-              "rows_doi":strip(final_rows),"rows_all":strip(rows_sorted[:max(target_n,500)]),"search_log":search_log}
-        with open(os.path.join(out_dir,"_moduleB_checkpoint.json"),"w",encoding="utf-8") as f:
-            json.dump(ckpt, f, ensure_ascii=False, indent=2)
-
-        if len(final_rows) < int(args.min_keep):
-            status = "DEGRADED"
-            log(L, f"[WARN] Мало записей: {len(final_rows)} < min_keep={int(args.min_keep)}")
-        if len(top100) >= 50 and hit_rate < float(args.min_anchor_hit):
-            status = "DEGRADED"
-            log(L, f"[WARN] Низкая релевантность: {hit_rate:.2f} < {float(args.min_anchor_hit):.2f}")
-
-        if status == "OK":
-            log(L, "[OK] Stage B завершён")
-            return 0
-        log(L, "[WARN] Stage B завершён в режиме DEGRADED")
-        return 0
+    return 0 if status in ("OK", "DEGRADED") else 1
 
 if __name__ == "__main__":
     try:
