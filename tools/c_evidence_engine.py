@@ -58,38 +58,29 @@ GENERIC_STOP = RU_STOP | EN_STOP | set(["resistance"])  # слово-trap, от�
 
 # --- domain vocab (как и раньше, но не будем усложнять) ---
 DOMAIN_KWS: Dict[str, List[str]] = {
-    "biomed": ["patient","clinical","therapy","treatment","cancer","infection","antibiotic","antimicrobial","microbiome",
-               "пациент","клинич","терап","лечен","рак","инфекц","антибиот","антибак","микробиот"],
-    "eco_evo": ["species","population","phylog","evolution","ecology","biodiversity","habitat","river","watershed","basin","landscape","riverscape",
-                "genetic","genome","wgs","ddrad","radseq","mtdna","introgression","speciation","glacial","fish",
-                "вид","популяц","филогеограф","эволюц","эколог","ареал","река","бассейн","ландшафт","генетик","геном","мтднк","рыб","гольян"],
-    "social": ["survey","policy","education","econom","market","marketing","psycholog","behavior",
-               "опрос","политик","образован","эконом","рынок","маркет","социолог","психолог","поведен"],
-    "tech": ["algorithm","machine","learning","neural","optimization","numerical","simulation","mesh","wavelet",
-             "алгоритм","машинн","обучен","нейрон","оптимиз","числен","моделирован","сетк","вейвлет"],
-    "humanities": ["language","linguistics","morphology","syntax","semantics","history",
-                   "язык","лингвист","морфолог","синтакс","семант","истори"],
-    "other": []
+    # Специально оставляем только нейтральные, кросс-доменные группы.
+    # Это убирает зависимость от узких словарей и помогает работать с любыми областями.
+    "science": ["study", "evidence", "experiment", "analysis", "result", "hypothesis", "исслед", "экспер", "доказ", "гипотез"],
+    "methods": ["method", "model", "dataset", "benchmark", "protocol", "метод", "модель", "данных", "протокол"],
+    "other": [],
 }
 
 # --- claim triggers: если claim про методы, требуем методные сигналы ---
 METHOD_TRIGGERS = {
     "prediction": [
-        "out-of-sample","outofsample","oos","cross-validation","crossvalidation","validation","predict","prediction","predictive",
-        "accuracy","auc","rmse","generalization","transferability","портируем","переносимость","валидац","кросс","предсказ","точност"
+        "out-of-sample","outofsample","cross-validation","crossvalidation","validation","predict","prediction",
+        "accuracy","auc","rmse","generalization","переносимость","валидац","кросс","предсказ","точност"
     ],
-    "gea": [
-        "gea","genotype-environment","genotypeenvironment","environmental association","lfmm","bayenv","rda","db-rda","gradient forest",
-        "генотип-среда","ассоциац","сред","lfmm","bayenv","градиент"
+    "causal": [
+        "causal","instrumental variable","difference-in-differences","regression discontinuity","randomized",
+        "каузал","причин","инструментальн","рандомиз"
     ],
-    "riverscape": [
-        "riverscape","river network","watershed","basin","stream","dendritic","isolation by resistance","ibr","circuit theory","effective resistance",
-        "least-cost","resistance distance","river-distance",
-        "риверскейп","река","речной","сеть","бассейн","дренаж","ibr","изол","сопротив"
+    "statistical": [
+        "bayesian","likelihood","posterior","p-value","confidence interval","hypothesis testing",
+        "байес","правдоподоб","апостериор","доверительн"
     ],
-    "latent_spatial": [
-        "latent","spatial basis","pcnm","mem","moran","eigenvector","gaussian process","mixed model","random effects",
-        "латент","пространствен","базис","pcnm","mem","moran","смешан","случайн"
+    "computational": [
+        "algorithm","optimization","simulation","neural","transformer","машинн","алгоритм","оптимиз","симуляц"
     ],
 }
 
@@ -376,7 +367,7 @@ def dedup_papers(papers: List[Paper]) -> List[Paper]:
 
 def validate_llm(obj: Dict[str, Any], candidates: List[Dict[str, Any]], run_id: str) -> Tuple[bool, str, List[Dict[str, Any]]]:
     if not isinstance(obj, dict):
-        return False, "Response is not a JSON object.", []
+        return False, "Ответ LLM не является JSON-объектом.", []
 
     meta = obj.get("meta") or {}
     rid = ""
@@ -384,19 +375,20 @@ def validate_llm(obj: Dict[str, Any], candidates: List[Dict[str, Any]], run_id: 
         rid = str(meta.get("run_id", "")).strip()
 
     if not run_id:
-        return False, "Pipeline run_id is missing.", []
+        return False, "Во внутреннем состоянии отсутствует run_id.", []
     if rid != run_id:
-        return False, f"run_id mismatch or missing (expected {run_id})", []
+        return False, f"run_id не совпадает или отсутствует (ожидалось {run_id})", []
 
     rows = obj.get("evidence_rows")
     if not isinstance(rows, list) or not rows:
-        return False, "Missing evidence_rows.", []
+        return False, "Отсутствует evidence_rows.", []
 
     allowed_rel = {"supports", "contradicts", "unclear"}
     allowed_cert = {"High", "Med", "Low"}
 
     # allowed pairs from candidates
     allowed_pairs = set()
+    source_texts: Dict[Tuple[int, str], str] = {}
     nclaims = 0
     for c in candidates:
         cid = int(c.get("claim_id", 0))
@@ -405,6 +397,7 @@ def validate_llm(obj: Dict[str, Any], candidates: List[Dict[str, Any]], run_id: 
             sid = str(s.get("source_id","")).strip()
             if sid:
                 allowed_pairs.add((cid, sid))
+                source_texts[(cid, sid)] = str(s.get("text_for_llm") or "")
 
     flat: List[Dict[str, Any]] = []
     per_claim = {}
@@ -434,24 +427,34 @@ def validate_llm(obj: Dict[str, Any], candidates: List[Dict[str, Any]], run_id: 
         if cert not in allowed_cert:
             cert = "Low"
 
+        quote = str(x.get("quote") or "").strip()
+        src_text = source_texts.get((cid, sid), "")
+        quote_ok = bool(quote) and (quote in src_text)
+        if not quote_ok:
+            rel = "unclear"
+            cert = "Low"
+            certainty_reason = "quote_not_found"
+        else:
+            certainty_reason = (x.get("certainty_reason") or "")[:120]
+
         per_claim[cid] = per_claim.get(cid, 0) + 1
 
         flat.append({
             "claim_id": cid,
             "source_id": sid,
             "relation": rel,
-            "quote": (x.get("quote") or "")[:260],
-            "quote_location": (x.get("quote_location") or "abstract"),
+            "quote": quote[:260],
+            "quote_location": (x.get("quote_location") or "abstract_only"),
             "certainty": cert,
-            "certainty_reason": (x.get("certainty_reason") or "")[:120],
+            "certainty_reason": certainty_reason,
         })
 
     if not flat:
-        return False, "No usable rows matched candidates.", []
+        return False, "Нет валидных строк evidence_rows, совпадающих с кандидатами.", []
 
     missing = [i for i in range(1, nclaims+1) if per_claim.get(i, 0) == 0]
     if missing:
-        return False, f"Missing rows for claim_id(s): {missing}", []
+        return False, f"Не хватает строк для claim_id: {missing}", []
 
     return True, "OK", flat
 
@@ -473,7 +476,7 @@ def write_md(path: Path, claims: List[str], rows: List[Dict[str, Any]], qc: Dict
 
     lines=[]
     lines.append("# Сводка доказательств (Stage C)\n")
-    lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    lines.append(f"Сформировано: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     lines.append("## QC и Screening (автоматически)\n")
 
     for k in ["mode","papers_total","kept_after_screening","no_abstract_pct","idea_domains","idea_conf","corpus_domain","corpus_conf",
@@ -488,7 +491,7 @@ def write_md(path: Path, claims: List[str], rows: List[Dict[str, Any]], qc: Dict
         con=sum(1 for x in rr if str(x.get("relation","")).lower()=="contradicts")
         unc=sum(1 for x in rr if str(x.get("relation","")).lower()=="unclear")
         lines.append(f"## Утверждение {i}\n{c}\n")
-        lines.append(f"- sources: {len(rr)} (supports={sup}, contradicts={con}, unclear={unc})\n")
+        lines.append(f"- источники: {len(rr)} (supports={sup}, contradicts={con}, unclear={unc})\n")
 
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -510,13 +513,8 @@ def main() -> int:
     in_dir, out_dir, logs_dir = idea_dir/"in", idea_dir/"out", idea_dir/"logs"
     ensure_dir(in_dir); ensure_dir(out_dir); ensure_dir(logs_dir)
 
-    # run_id persistence (prevents using stale ChatGPT answers)
-    run_id_file = out_dir/"run_id_C.txt"
-    if run_id_file.exists():
-        run_id = read_text_utf8_sig(run_id_file).strip() or now_stamp()
-    else:
-        run_id = now_stamp()
-        run_id_file.write_text(run_id, encoding="utf-8")
+    # Deep mode handshake: каждый новый запуск без pending требует новый ответ ChatGPT.
+    pending_run_file = out_dir/"run_id_C_pending.txt"
 
     log_path=logs_dir/f"moduleC_{now_stamp()}.log"
     def log(s:str)->None:
@@ -527,19 +525,19 @@ def main() -> int:
         structured=out_dir/"structured_idea.json"
         corpus=out_dir/"corpus.csv"
         if not structured.exists():
-            log("[ERROR] Missing out/structured_idea.json"); return 1
+            log("[ОШИБКА] Нет out/structured_idea.json"); return 1
         if not corpus.exists():
-            log("[ERROR] Missing out/corpus.csv"); return 1
+            log("[ОШИБКА] Нет out/corpus.csv"); return 1
 
         st=load_structured_idea(structured)
         idea_text=idea_text_all(st)
         claims=extract_claims(st, max_n=max(1,int(args.claims_max)))
         if not claims:
-            log("[ERROR] Could not extract claims"); return 1
+            log("[ОШИБКА] Не удалось извлечь claims"); return 1
 
         papers_all=dedup_papers(load_corpus(corpus))
         if not papers_all:
-            log("[ERROR] corpus.csv empty"); return 1
+            log("[ОШИБКА] corpus.csv пуст"); return 1
 
         # QC domain
         idea_sc = domain_scores(idea_text)
@@ -555,7 +553,7 @@ def main() -> int:
         corpus_dom = max(counts.items(), key=lambda x: x[1])[0]
         corpus_conf = (counts.get(corpus_dom, 0) / max(1, len(papers_all)))
 
-        allowed = [idea_dom] if idea_dom != "other" and idea_conf >= 0.35 else [corpus_dom]
+        allowed = ["any"]
 
         qc: Dict[str, Any] = {
             "mode": mode,
@@ -574,6 +572,9 @@ def main() -> int:
         # screen by allowed domain
         screened=[]
         for p in papers_all:
+            if allowed == ["any"]:
+                screened.append(p)
+                continue
             d, conf = pick_top_domain(domain_scores(p.text))
             if d not in allowed and conf >= 0.60 and d != "other":
                 qc["dropped"]["hard_out_of_domain"] += 1
@@ -614,9 +615,9 @@ def main() -> int:
                     if abs_clean and len(abs_clean) > int(args.prompt_max_abs):
                         abs_clean = abs_clean[:int(args.prompt_max_abs)]+"…"
                     if abs_clean:
-                        text_for_llm=abs_clean; quote_hint="abstract"
+                        text_for_llm=abs_clean; quote_hint="abstract_only"
                     else:
-                        text_for_llm=f"TITLE_ONLY: {p.title}"; quote_hint="title"
+                        text_for_llm=f"TITLE_ONLY: {p.title}"; quote_hint="abstract_only"
                     dom, conf = pick_top_domain(domain_scores(p.text))
                     top.append({
                         "source_id": f"S{len(top)+1}",
@@ -647,9 +648,9 @@ def main() -> int:
                 if abs_clean and len(abs_clean) > int(args.prompt_max_abs):
                     abs_clean = abs_clean[:int(args.prompt_max_abs)]+"…"
                 if abs_clean:
-                    text_for_llm=abs_clean; quote_hint="abstract"
+                    text_for_llm=abs_clean; quote_hint="abstract_only"
                 else:
-                    text_for_llm=f"TITLE_ONLY: {p.title}"; quote_hint="title"
+                    text_for_llm=f"TITLE_ONLY: {p.title}"; quote_hint="abstract_only"
                 dom, conf = pick_top_domain(domain_scores(p.text))
                 top.append({
                     "source_id": f"S{len(top)+1}",
@@ -682,7 +683,7 @@ def main() -> int:
         )
 
         if total == 0:
-            log("[ERROR] No candidates found."); return 1
+            log("[ОШИБКА] Не найдено кандидатов по claims."); return 1
 
         # LLM handoff
         llm_path = in_dir/"llm_evidence.json"
@@ -697,29 +698,52 @@ def main() -> int:
                         "source_id": s["source_id"], "doi": s.get("doi",""), "title": s.get("title",""),
                         "year": s.get("year",""), "venue": s.get("venue",""), "openalex_id": s.get("openalex_id",""),
                         "relation": "unclear", "quote": (s.get("abstract") or s.get("title") or "")[:260],
-                        "quote_location": "abstract|title", "certainty": "Low", "certainty_reason": "no_llm_mode"
+                        "quote_location": "abstract_only", "certainty": "Low", "certainty_reason": "no_llm_mode|abstract_only"
                     })
             write_csv(out_dir/"evidence_table.csv", rows)
             write_md(out_dir/"evidence_summary.md", claims, rows, qc)
-            log("[OK] no-llm complete"); return 0
+            log("[OK] Режим no-LLM завершён"); return 0
+
+        def write_waiting_packet(reason: str, expected_run_id: str) -> None:
+            tpl = Path(__file__).resolve().parents[1]/"config"/"prompts"/"llm_moduleC_prompt.txt"
+            qc_local = dict(qc)
+            qc_local["run_id"] = expected_run_id
+            packet = json.dumps({"claims": candidates, "qc": qc_local}, ensure_ascii=False, indent=2)
+            prompt = read_text_utf8_sig(tpl).replace("{{CANDIDATES_JSON}}", packet)
+            prompt_path.write_text(prompt, encoding="utf-8")
+            llm_path.write_text(json.dumps({
+                "paste": "Вставьте сюда JSON-ответ ChatGPT (полностью замените файл)",
+                "reason_pipeline_waiting": reason,
+                "expected_run_id": expected_run_id,
+                "mode": "deep",
+                "format": "json_only"
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        pending_run_id = read_text_utf8_sig(pending_run_file).strip() if pending_run_file.exists() else ""
+        if not pending_run_id:
+            pending_run_id = now_stamp()
+            pending_run_file.write_text(pending_run_id, encoding="utf-8")
+            write_waiting_packet("Требуется новый ответ ChatGPT для текущего запуска Deep.", pending_run_id)
+            log("[ТРЕБУЕТСЯ] ChatGPT: создан новый run_id=" + pending_run_id)
+            return 2
 
         if not llm_path.exists():
-            llm_path.write_text('{"paste":"Paste ChatGPT JSON here (replace this file)"}\n', encoding="utf-8")
+            write_waiting_packet("Ожидается JSON-ответ ChatGPT.", pending_run_id)
+            log("[ТРЕБУЕТСЯ] ChatGPT: нет файла in/llm_evidence.json")
+            return 2
 
         raw = read_text_utf8_sig(llm_path)
         try:
-            obj = extract_json(raw) if raw.strip() else {"paste":"Paste ChatGPT JSON here"}
+            obj = extract_json(raw) if raw.strip() else {"paste":"Вставьте сюда JSON-ответ ChatGPT"}
         except Exception:
-            obj = {"paste":"Paste ChatGPT JSON here"}
+            obj = {"paste":"Вставьте сюда JSON-ответ ChatGPT"}
 
-        ok, why, flat = validate_llm(obj, candidates, run_id)
+        ok, why, flat = validate_llm(obj, candidates, pending_run_id)
         if not ok:
-            tpl = Path(__file__).resolve().parents[1]/"config"/"prompts"/"llm_moduleC_prompt.txt"
-            packet = json.dumps({"claims": candidates, "qc": qc}, ensure_ascii=False, indent=2)
-            prompt = read_text_utf8_sig(tpl).replace("{{CANDIDATES_JSON}}", packet)
-            prompt_path.write_text(prompt, encoding="utf-8")
-            llm_path.write_text(json.dumps({"paste":"Paste ChatGPT JSON here (replace this file)","reason_pipeline_waiting": why, "expected_run_id": run_id}, ensure_ascii=False, indent=2), encoding="utf-8")
-            log("[NEED] LLM: " + why)
+            pending_run_id = now_stamp()
+            pending_run_file.write_text(pending_run_id, encoding="utf-8")
+            write_waiting_packet(f"{why}. Сформирован новый run_id.", pending_run_id)
+            log("[ТРЕБУЕТСЯ] ChatGPT: " + why + "; новый run_id=" + pending_run_id)
             return 2
 
         # merge back
@@ -753,19 +777,21 @@ def main() -> int:
                 "claim_id": cid, "claim": claim_text.get(cid,""),
                 "source_id": sid, "doi": meta.get("doi",""), "title": meta.get("title",""),
                 "year": meta.get("year",""), "venue": meta.get("venue",""), "openalex_id": meta.get("openalex_id",""),
-                "relation": rel, "quote": quote, "quote_location": (r.get("quote_location") or meta.get("quote_hint") or "abstract"),
+                "relation": rel, "quote": quote, "quote_location": (r.get("quote_location") or meta.get("quote_hint") or "abstract_only"),
                 "certainty": cert, "certainty_reason": (r.get("certainty_reason") or "").strip()
             })
 
         if not out_rows:
-            log("[ERROR] LLM JSON parsed but no rows matched."); return 1
+            log("[ОШИБКА] JSON от LLM прочитан, но валидных строк нет."); return 1
 
         write_csv(out_dir/"evidence_table.csv", out_rows)
         write_md(out_dir/"evidence_summary.md", claims, out_rows, qc)
-        log("[OK] Module C complete"); return 0
+        if pending_run_file.exists():
+            pending_run_file.unlink()
+        log("[OK] Module C завершён"); return 0
 
     except Exception as e:
-        log("[ERROR] " + repr(e))
+        log("[ОШИБКА] " + repr(e))
         log(traceback.format_exc())
         return 1
 
