@@ -9,10 +9,10 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -23,6 +23,7 @@ OPENALEX_BASE = "https://api.openalex.org"
 UNPAYWALL_BASE = "https://api.unpaywall.org/v2"
 CROSSREF_BASE = "https://api.crossref.org/works"
 EUROPEPMC_BASE = "https://www.ebi.ac.uk/europepmc/webservices/rest"
+SEMANTIC_SCHOLAR_BASE = "https://api.semanticscholar.org/graph/v1"
 
 
 class RunLogger:
@@ -35,8 +36,7 @@ class RunLogger:
         self.fp.close()
 
     def _write(self, level: str, msg: str) -> None:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{ts}] [{level}] {msg}"
+        line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{level}] {msg}"
         print(line)
         self.fp.write(line + "\n")
         self.fp.flush()
@@ -49,6 +49,42 @@ class RunLogger:
 
     def err(self, msg: str) -> None:
         self._write("ERR", msg)
+
+
+class ApiClient:
+    def __init__(self, name: str, rps: float, timeout: int, logger: RunLogger):
+        self.name = name
+        self.rps = rps
+        self.timeout = timeout
+        self.logger = logger
+        self.next_allowed = 0.0
+        self.session = requests.Session()
+
+    def _wait(self) -> None:
+        if self.rps <= 0:
+            return
+        now = time.monotonic()
+        if now < self.next_allowed:
+            time.sleep(self.next_allowed - now)
+        self.next_allowed = time.monotonic() + (1.0 / self.rps)
+
+    def get_json(self, url: str, headers: Optional[Dict[str, str]] = None, retries: int = 4) -> Dict[str, Any]:
+        self._wait()
+        backoff = 1.0
+        for i in range(retries):
+            try:
+                r = self.session.get(url, timeout=self.timeout, headers=headers or {})
+                if r.status_code in (429, 500, 502, 503, 504):
+                    raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+                r.raise_for_status()
+                return r.json()
+            except Exception as exc:
+                if i >= retries - 1:
+                    raise RuntimeError(f"{self.name}: ошибка запроса: {exc}") from exc
+                self.logger.warn(f"{self.name}: retry {i + 1}/{retries} после ошибки: {exc}")
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 12.0)
+        return {}
 
 
 def read_env_file(path: Path) -> Dict[str, str]:
@@ -66,11 +102,13 @@ def read_env_file(path: Path) -> Dict[str, str]:
 
 def load_secrets(root: Path) -> Dict[str, str]:
     env = read_env_file(root / "config" / "secrets.env")
-    for k in ["OPENALEX_API_KEY", "UNPAYWALL_EMAIL", "CROSSREF_MAILTO", "OPENALEX_MAILTO", "EUROPEPMC_EMAIL"]:
+    for k in ["OPENALEX_API_KEY", "UNPAYWALL_EMAIL", "CROSSREF_MAILTO", "OPENALEX_MAILTO", "EUROPEPMC_EMAIL", "S2_API_KEY"]:
         if os.environ.get(k):
             env[k] = os.environ[k]
     if not env.get("CROSSREF_MAILTO") and env.get("UNPAYWALL_EMAIL"):
         env["CROSSREF_MAILTO"] = env["UNPAYWALL_EMAIL"]
+    if not env.get("OPENALEX_MAILTO") and env.get("UNPAYWALL_EMAIL"):
+        env["OPENALEX_MAILTO"] = env["UNPAYWALL_EMAIL"]
     return env
 
 
@@ -78,18 +116,28 @@ def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
 
 
+def normalize_doi(doi: str) -> str:
+    x = normalize_text(doi).lower()
+    x = re.sub(r"^https?://(dx\.)?doi\.org/", "", x)
+    return x
+
+
 def slugify_id(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"https?://", "", s)
-    s = re.sub(r"[^a-z0-9._-]+", "_", s)
-    return s.strip("_")[:120] or "paper"
+    x = normalize_text(s).lower()
+    x = re.sub(r"https?://", "", x)
+    x = re.sub(r"[^a-z0-9._-]+", "_", x)
+    return x.strip("_")[:120] or "paper"
 
 
-def to_float(v: Any, default: float = 0.0) -> float:
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return default
+def undo_inverted_index(inv: Dict[str, List[int]]) -> str:
+    pairs: List[Tuple[int, str]] = []
+    for token, indexes in (inv or {}).items():
+        for idx in indexes or []:
+            pairs.append((int(idx), token))
+    if not pairs:
+        return ""
+    pairs.sort(key=lambda x: x[0])
+    return normalize_text(" ".join(tok for _, tok in pairs))
 
 
 def to_int(v: Any, default: int = 0) -> int:
@@ -99,22 +147,16 @@ def to_int(v: Any, default: int = 0) -> int:
         return default
 
 
-def undo_inverted_index(inv: Dict[str, List[int]]) -> str:
-    if not inv:
-        return ""
-    pairs: List[Tuple[int, str]] = []
-    for token, pos_list in inv.items():
-        for pos in pos_list or []:
-            pairs.append((int(pos), token))
-    if not pairs:
-        return ""
-    pairs.sort(key=lambda x: x[0])
-    return normalize_text(" ".join(t for _, t in pairs))
+def to_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return default
 
 
 def find_idea_dir(root: Path, explicit: Optional[str]) -> Path:
     if explicit:
-        p = Path(explicit).expanduser()
+        p = Path(explicit)
         if not p.is_absolute():
             p = (root / p).resolve()
         if not p.exists():
@@ -130,80 +172,10 @@ def find_idea_dir(root: Path, explicit: Optional[str]) -> Path:
                 p = (root / raw).resolve()
             if p.exists():
                 return p
-    candidates = sorted([x for x in ideas.glob("IDEA-*") if x.is_dir()], key=lambda x: x.name, reverse=True)
-    if not candidates:
+    found = sorted([x for x in ideas.glob("IDEA-*") if x.is_dir()], key=lambda x: x.name, reverse=True)
+    if not found:
         raise FileNotFoundError("Не найдено ни одной папки ideas/IDEA-*")
-    return candidates[0]
-
-
-@dataclass
-class ApiClient:
-    name: str
-    rps: float
-    timeout: int
-    logger: RunLogger
-
-    def __post_init__(self) -> None:
-        self._next_allowed = 0.0
-        self.session = requests.Session()
-
-    def _wait_rate(self) -> None:
-        if self.rps <= 0:
-            return
-        now = time.monotonic()
-        if now < self._next_allowed:
-            time.sleep(self._next_allowed - now)
-        self._next_allowed = time.monotonic() + 1.0 / self.rps
-
-    def get_json(self, url: str, headers: Optional[Dict[str, str]] = None, retries: int = 4) -> Dict[str, Any]:
-        self._wait_rate()
-        backoff = 1.0
-        h = headers or {}
-        for attempt in range(1, retries + 1):
-            try:
-                r = self.session.get(url, headers=h, timeout=self.timeout)
-                if r.status_code in (429, 500, 502, 503, 504):
-                    raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
-                r.raise_for_status()
-                return r.json()
-            except Exception as exc:
-                status = getattr(getattr(exc, "response", None), "status_code", "-")
-                if attempt >= retries:
-                    raise RuntimeError(f"{self.name}: ошибка запроса ({status}): {exc}") from exc
-                self.logger.warn(f"{self.name}: повтор {attempt}/{retries} после ошибки ({status}): {exc}")
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, 12.0)
-        return {}
-
-
-def extract_keywords(structured_path: Path) -> List[str]:
-    if not structured_path.exists():
-        return []
-    try:
-        data = json.loads(structured_path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return []
-    raw: List[str] = []
-    keys = data.get("keywords_for_search") or data.get("keywords") or []
-    if isinstance(keys, list):
-        raw.extend(str(x) for x in keys)
-    elif isinstance(keys, str):
-        raw.extend(re.split(r"[,;\n]", keys))
-    return [normalize_text(x).lower() for x in raw if normalize_text(x)]
-
-
-def keyword_overlap(text: str, keywords: List[str]) -> int:
-    t = (text or "").lower()
-    return sum(1 for kw in keywords if kw and kw in t)
-
-
-def build_paper_id(row: Dict[str, str], idx: int) -> str:
-    for k in ["openalex_id", "doi", "pmid", "arxiv_id"]:
-        if row.get(k):
-            return slugify_id(str(row[k]))
-    title = slugify_id(row.get("title", "")[:80])
-    year = row.get("year", "")
-    return f"{title}_{year}_{idx+1}"
+    return found[0]
 
 
 def load_corpus(path: Path) -> List[Dict[str, str]]:
@@ -211,100 +183,433 @@ def load_corpus(path: Path) -> List[Dict[str, str]]:
         return list(csv.DictReader(f))
 
 
-def choose_selection(rows: List[Dict[str, str]], keywords: List[str], max_abstracts: int, max_pdfs: int) -> List[Dict[str, Any]]:
-    prepared: List[Dict[str, Any]] = []
-    for i, row in enumerate(rows):
-        score = to_float(row.get("score", 0.0), 0.0)
-        cited_by = to_int(row.get("cited_by", 0), 0)
-        doi = normalize_text(row.get("doi", ""))
-        oa_pdf = normalize_text(row.get("oa_pdf_url", ""))
-        title = normalize_text(row.get("title", ""))
-        abstract = normalize_text(row.get("abstract", ""))
-        hay = " ".join([title, abstract, row.get("topics", ""), row.get("concepts", "")])
-        kw_hits = keyword_overlap(hay, keywords)
-
-        priority = score
-        reasons: List[str] = []
-        if score > 0:
-            reasons.append("высокий score")
-        if doi:
-            priority += 1.2
-            reasons.append("есть DOI")
-        if oa_pdf:
-            priority += 1.2
-            reasons.append("есть OA PDF")
-        if cited_by > 0:
-            priority += min(cited_by / 200.0, 2.5)
-            if cited_by >= 20:
-                reasons.append("высокие цитирования")
-        if kw_hits > 0:
-            priority += min(kw_hits * 0.8, 3.0)
-            reasons.append("совпадение по ключевым словам")
-
-        prepared.append(
-            {
-                "row": row,
-                "paper_id": build_paper_id(row, i),
-                "priority": priority,
-                "kw_hits": kw_hits,
-                "reason": "; ".join(dict.fromkeys(reasons)) if reasons else "базовый отбор",
-                "pdf_candidate": bool(oa_pdf or doi or row.get("pmid")),
-            }
-        )
-
-    prepared.sort(key=lambda x: (-x["priority"], x["paper_id"]))
-    abs_ids = {x["paper_id"] for x in prepared[:max_abstracts]}
-
-    pdf_sorted = sorted([x for x in prepared if x["pdf_candidate"]], key=lambda x: (-x["priority"], x["paper_id"]))
-    pdf_ids = {x["paper_id"] for x in pdf_sorted[:max_pdfs]}
-
-    result: List[Dict[str, Any]] = []
-    for item in prepared:
-        row = item["row"]
-        result.append(
-            {
-                "paper_id": item["paper_id"],
-                "doi": normalize_text(row.get("doi", "")),
-                "openalex_id": normalize_text(row.get("openalex_id", "")),
-                "title": normalize_text(row.get("title", "")),
-                "year": normalize_text(row.get("year", "")),
-                "select_for_abstract": 1 if item["paper_id"] in abs_ids else 0,
-                "select_for_pdf": 1 if item["paper_id"] in pdf_ids else 0,
-                "reason": item["reason"],
-                "priority": round(item["priority"], 4),
-                "source_row": row,
-            }
-        )
-    return result
+def write_json(path: Path, obj: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def write_selection_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    cols = [
-        "paper_id",
-        "doi",
-        "openalex_id",
-        "title",
-        "year",
-        "select_for_abstract",
-        "select_for_pdf",
-        "reason",
-    ]
+def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def write_csv(path: Path, rows: List[Dict[str, Any]], columns: List[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
+        w = csv.DictWriter(f, fieldnames=columns)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in cols})
+            w.writerow({c: r.get(c, "") for c in columns})
+
+
+def copy_to_clipboard(text: str) -> bool:
+    try:
+        import pyperclip  # type: ignore
+
+        pyperclip.copy(text)
+        return True
+    except Exception:
+        pass
+    for cmd in (["clip"], ["powershell", "-NoProfile", "-Command", "Set-Clipboard -Value ([Console]::In.ReadToEnd())"], ["xclip", "-selection", "clipboard"], ["pbcopy"]):
+        try:
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"), timeout=10)
+            if p.returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def build_paper_id(row: Dict[str, str], idx: int) -> str:
+    for k in ["openalex_id", "doi", "pmid", "arxiv_id"]:
+        if normalize_text(row.get(k, "")):
+            return slugify_id(normalize_text(row.get(k, "")))
+    return f"paper_{idx+1}"
+
+
+def extract_idea_context(idea_dir: Path) -> Tuple[str, Dict[str, Any], List[str]]:
+    idea_text = ""
+    structured: Dict[str, Any] = {}
+    for p in [idea_dir / "in" / "idea.txt", idea_dir / "idea.txt"]:
+        if p.exists():
+            idea_text = p.read_text(encoding="utf-8", errors="replace")
+            break
+    sp = idea_dir / "out" / "structured_idea.json"
+    if not sp.exists():
+        sp = idea_dir / "in" / "llm_response.json"
+    if sp.exists():
+        raw = sp.read_text(encoding="utf-8", errors="replace")
+        try:
+            structured = json.loads(raw)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if m:
+                try:
+                    structured = json.loads(m.group(0))
+                except Exception:
+                    structured = {}
+
+    kw: List[str] = []
+    for key in ["keywords", "keywords_for_search", "topics", "domains"]:
+        v = structured.get(key)
+        if isinstance(v, list):
+            kw.extend(str(x) for x in v)
+        elif isinstance(v, str):
+            kw.extend(re.split(r"[,;\n]", v))
+    if not kw and idea_text:
+        stop = {
+            "если", "чтобы", "когда", "между", "который", "которые", "также", "этого", "этой", "идея", "проект",
+            "study", "using", "with", "from", "that", "this", "into", "across", "between", "paper", "research",
+        }
+        tokens = re.findall(r"[A-Za-zА-Яа-я0-9-]{4,}", idea_text)
+        freq = Counter(t.lower() for t in tokens if t.lower() not in stop)
+        kw = [w for w, _ in freq.most_common(20)]
+    kw = [normalize_text(x).lower() for x in kw if normalize_text(x)]
+    return idea_text.strip(), structured, list(dict.fromkeys(kw))[:20]
+
+
+def get_openalex_work(row: Dict[str, str], oa: ApiClient, secrets: Dict[str, str]) -> Tuple[Dict[str, Any], str]:
+    doi = normalize_doi(row.get("doi", ""))
+    openalex_id = normalize_text(row.get("openalex_id", ""))
+    q = []
+    if secrets.get("OPENALEX_API_KEY"):
+        q.append(f"api_key={requests.utils.quote(secrets['OPENALEX_API_KEY'])}")
+    if secrets.get("OPENALEX_MAILTO"):
+        q.append(f"mailto={requests.utils.quote(secrets['OPENALEX_MAILTO'])}")
+    qs = ("?" + "&".join(q)) if q else ""
+    urls: List[str] = []
+    if openalex_id:
+        short = openalex_id.split("/")[-1] if openalex_id.startswith("http") else openalex_id
+        urls.append(f"{OPENALEX_BASE}/works/{requests.utils.quote(short, safe='')}{qs}")
+    if doi:
+        urls.append(f"{OPENALEX_BASE}/works/https://doi.org/{requests.utils.quote(doi, safe='')}{qs}")
+    for url in urls:
+        try:
+            return oa.get_json(url), url
+        except Exception:
+            continue
+    return {}, urls[0] if urls else ""
+
+
+def discover_idea_topics(oa: ApiClient, keywords: List[str], secrets: Dict[str, str], logger: RunLogger) -> Dict[str, set]:
+    topic_ids: set = set()
+    domain_tokens: set = set()
+    field_tokens: set = set()
+    subfield_tokens: set = set()
+    q = []
+    if secrets.get("OPENALEX_API_KEY"):
+        q.append(f"api_key={requests.utils.quote(secrets['OPENALEX_API_KEY'])}")
+    if secrets.get("OPENALEX_MAILTO"):
+        q.append(f"mailto={requests.utils.quote(secrets['OPENALEX_MAILTO'])}")
+    tail = ("&" + "&".join(q)) if q else ""
+    for kw in keywords[:8]:
+        url = f"{OPENALEX_BASE}/topics?search={requests.utils.quote(kw)}&per-page=10{tail}"
+        try:
+            items = oa.get_json(url).get("results") or []
+        except Exception as exc:
+            logger.warn(f"Не удалось получить topics для '{kw}': {exc}")
+            continue
+        for t in items:
+            tid = normalize_text(t.get("id", "")).split("/")[-1]
+            if tid:
+                topic_ids.add(tid)
+            for key, bag in [("domain", domain_tokens), ("field", field_tokens), ("subfield", subfield_tokens)]:
+                obj = t.get(key) or {}
+                name = normalize_text(obj.get("display_name", "")).lower()
+                if name:
+                    bag.add(name)
+    return {"topic_ids": topic_ids, "domains": domain_tokens, "fields": field_tokens, "subfields": subfield_tokens}
+
+
+def compute_domain_match(work: Dict[str, Any], idea_topics: Dict[str, set]) -> Tuple[int, Dict[str, str]]:
+    pt = work.get("primary_topic") or {}
+    wid = normalize_text(pt.get("id", "")).split("/")[-1]
+    domain = normalize_text((pt.get("domain") or {}).get("display_name", "")).lower()
+    field = normalize_text((pt.get("field") or {}).get("display_name", "")).lower()
+    subfield = normalize_text((pt.get("subfield") or {}).get("display_name", "")).lower()
+    score = 0
+    if wid and wid in idea_topics["topic_ids"]:
+        score += 3
+    if domain and domain in idea_topics["domains"]:
+        score += 2
+    if field and field in idea_topics["fields"]:
+        score += 2
+    if subfield and subfield in idea_topics["subfields"]:
+        score += 1
+    return score, {"primary_topic_id": wid, "domain": domain, "field": field, "subfield": subfield}
+
+
+def preclean_corpus(rows: List[Dict[str, str]], oa: ApiClient, secrets: Dict[str, str], keywords: List[str], logger: RunLogger, max_candidates: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
+    after_basic: List[Dict[str, str]] = []
+    rejected: List[Dict[str, Any]] = []
+    doi_seen: Dict[str, str] = {}
+
+    for i, r in enumerate(rows):
+        rr = dict(r)
+        rr["doi"] = normalize_doi(rr.get("doi", ""))
+        rr["title"] = normalize_text(rr.get("title", ""))
+        rr["openalex_id"] = normalize_text(rr.get("openalex_id", ""))
+        if rr["doi"]:
+            if rr["doi"] in doi_seen:
+                rejected.append({"index": i + 1, "title": rr["title"], "doi": rr["doi"], "openalex_id": rr["openalex_id"], "reason": "дубликат DOI"})
+                continue
+            doi_seen[rr["doi"]] = rr["title"]
+        if not rr["title"] or not (rr["doi"] or rr["openalex_id"]):
+            rejected.append({"index": i + 1, "title": rr["title"], "doi": rr["doi"], "openalex_id": rr["openalex_id"], "reason": "нет title и/или (doi/openalex_id)"})
+            continue
+        after_basic.append(rr)
+
+    idea_topics = discover_idea_topics(oa, keywords, secrets, logger) if keywords else {"topic_ids": set(), "domains": set(), "fields": set(), "subfields": set()}
+
+    candidates: List[Dict[str, Any]] = []
+    for idx, r in enumerate(after_basic):
+        item = {
+            "paper_id": build_paper_id(r, idx),
+            "title": r.get("title", ""),
+            "year": normalize_text(r.get("year", "")),
+            "doi": r.get("doi", ""),
+            "openalex_id": r.get("openalex_id", ""),
+            "venue": normalize_text(r.get("venue", "")),
+            "pmid": normalize_text(r.get("pmid", "")),
+            "oa_pdf_url": normalize_text(r.get("oa_pdf_url", "")),
+            "score": to_float(r.get("score", 0.0)),
+            "cited_by": to_int(r.get("cited_by", 0)),
+            "abstract_snippet": normalize_text((r.get("abstract") or "")[:600]),
+            "source_row": r,
+        }
+        domain_score = 1
+        topic_info = {"primary_topic_id": "", "domain": "", "field": "", "subfield": ""}
+        if idea_topics["topic_ids"] or idea_topics["domains"] or idea_topics["fields"] or idea_topics["subfields"]:
+            work, _ = get_openalex_work(r, oa, secrets)
+            if work:
+                domain_score, topic_info = compute_domain_match(work, idea_topics)
+            else:
+                domain_score = 1
+        item.update(topic_info)
+        item["domain_match_score"] = domain_score
+        if domain_score == 0:
+            rejected.append({"index": idx + 1, "title": item["title"], "doi": item["doi"], "openalex_id": item["openalex_id"], "reason": "domain_match_score=0"})
+            continue
+        candidates.append(item)
+
+    candidates.sort(key=lambda x: (-x["score"], -x["cited_by"], x["paper_id"]))
+    candidates = candidates[:max_candidates]
+
+    stats = {
+        "corpus_n": len(rows),
+        "after_dedup_n": len(after_basic),
+        "after_domain_filter_n": len(candidates),
+        "rejected_pre_n": len(rejected),
+    }
+    return candidates, rejected, stats
+
+
+def generate_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
+    reduced_candidates = [
+        {
+            "paper_id": c["paper_id"],
+            "title": c["title"],
+            "year": c["year"],
+            "doi": c["doi"],
+            "venue": c["venue"],
+            "abstract_snippet": c["abstract_snippet"],
+            "primary_topic": {
+                "domain": c.get("domain", ""),
+                "field": c.get("field", ""),
+                "subfield": c.get("subfield", ""),
+            },
+        }
+        for c in candidates
+    ]
+    payload = {
+        "idea_text": idea_text,
+        "structured_idea": structured,
+        "max_abstracts": max_abs,
+        "max_pdfs": max_pdf,
+        "strict_contract": {
+            "selected": [
+                {
+                    "paper_id": "<id из candidates>",
+                    "select_for_abstract": 1,
+                    "select_for_pdf": 0,
+                    "reason": "коротко по-русски",
+                }
+            ],
+            "notes": "optional",
+        },
+        "rules": [
+            "Верни только JSON без поясняющего текста.",
+            "paper_id только из списка candidates.",
+            "select_for_pdf=1 только если select_for_abstract=1.",
+            f"Не более {max_abs} с select_for_abstract=1.",
+            f"Не более {max_pdf} с select_for_pdf=1.",
+            "Не добавляй новые DOI/ID и не меняй paper_id.",
+        ],
+        "candidates": reduced_candidates,
+    }
+    return (
+        "Ты выполняешь семантический screening научных работ по идее. "
+        "Нужно строго выбрать релевантные статьи по смыслу и вернуть только JSON.\n\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
+def parse_screening_response(path: Path) -> Dict[str, Any]:
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        return json.loads(raw)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if not m:
+            raise ValueError("Не найден JSON-объект в ответе")
+        return json.loads(m.group(0))
+
+
+def validate_screening_response(data: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> Tuple[List[Dict[str, Any]], List[str]]:
+    errors: List[str] = []
+    if not isinstance(data, dict) or not isinstance(data.get("selected"), list):
+        return [], ["Корень ответа должен быть объектом с массивом 'selected'."]
+
+    c_map = {c["paper_id"]: c for c in candidates}
+    selected: List[Dict[str, Any]] = []
+    abs_count = 0
+    pdf_count = 0
+
+    for i, row in enumerate(data.get("selected") or []):
+        if not isinstance(row, dict):
+            errors.append(f"selected[{i}] не объект")
+            continue
+        pid = normalize_text(str(row.get("paper_id", "")))
+        if pid not in c_map:
+            errors.append(f"selected[{i}].paper_id отсутствует в candidates: {pid}")
+            continue
+        a = int(row.get("select_for_abstract", 0))
+        p = int(row.get("select_for_pdf", 0))
+        if p == 1 and a != 1:
+            errors.append(f"{pid}: select_for_pdf=1 требует select_for_abstract=1")
+            continue
+        if a not in (0, 1) or p not in (0, 1):
+            errors.append(f"{pid}: select_for_abstract/select_for_pdf должны быть 0 или 1")
+            continue
+        if a == 1:
+            abs_count += 1
+        if p == 1:
+            pdf_count += 1
+        selected.append(
+            {
+                **c_map[pid],
+                "select_for_abstract": a,
+                "select_for_pdf": p,
+                "reason": normalize_text(row.get("reason", "")) or "без причины",
+            }
+        )
+
+    if abs_count > max_abs:
+        errors.append(f"Превышен лимит abstracts: {abs_count} > {max_abs}")
+    if pdf_count > max_pdf:
+        errors.append(f"Превышен лимит pdfs: {pdf_count} > {max_pdf}")
+    return selected, errors
+
+
+def fetch_openalex_abstract(row: Dict[str, Any], oa: ApiClient, secrets: Dict[str, str]) -> Tuple[str, str]:
+    work, url = get_openalex_work(row, oa, secrets)
+    return undo_inverted_index(work.get("abstract_inverted_index") or {}), url
+
+
+def fetch_europepmc_abstract(pmid: str, epmc: ApiClient) -> Tuple[str, str]:
+    u = f"{EUROPEPMC_BASE}/search?query=EXT_ID:{requests.utils.quote(pmid)}%20AND%20SRC:MED&format=json&pageSize=1"
+    j = epmc.get_json(u)
+    items = (j.get("resultList") or {}).get("result") or []
+    return normalize_text((items[0].get("abstractText", "") if items else "")), u
+
+
+def crossref_to_text(raw: str) -> str:
+    return normalize_text(re.sub(r"<[^>]+>", " ", raw or ""))
+
+
+def fetch_crossref_abstract(doi: str, cr: ApiClient, mailto: str) -> Tuple[str, str]:
+    h = {"User-Agent": f"IDEA_PIPELINE_C1/1.0 (mailto:{mailto})"}
+    u = f"{CROSSREF_BASE}/{requests.utils.quote(doi, safe='')}?mailto={requests.utils.quote(mailto)}"
+    j = cr.get_json(u, headers=h)
+    return crossref_to_text((j.get("message") or {}).get("abstract", "")), u
+
+
+def fetch_semantic_scholar(doi: str, title: str, s2: ApiClient, api_key: str) -> Tuple[Dict[str, Any], str]:
+    headers = {"x-api-key": api_key} if api_key else {}
+    if doi:
+        u = f"{SEMANTIC_SCHOLAR_BASE}/paper/DOI:{requests.utils.quote(doi, safe='')}?fields=abstract,openAccessPdf"
+        return s2.get_json(u, headers=headers), u
+    q = requests.utils.quote(title[:140])
+    u = f"{SEMANTIC_SCHOLAR_BASE}/paper/search?query={q}&limit=1&fields=abstract,openAccessPdf,title"
+    j = s2.get_json(u, headers=headers)
+    data = j.get("data") or []
+    return (data[0] if data else {}), u
+
+
+def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str) -> Tuple[List[str], str]:
+    u = f"{UNPAYWALL_BASE}/{requests.utils.quote(doi, safe='')}?email={requests.utils.quote(email)}"
+    j = up.get_json(u)
+    urls: List[str] = []
+    best = (j.get("best_oa_location") or {}).get("url_for_pdf")
+    if best:
+        urls.append(best)
+    for loc in j.get("oa_locations") or []:
+        x = normalize_text(loc.get("url_for_pdf", ""))
+        if x:
+            urls.append(x)
+    uniq = []
+    seen = set()
+    for x in urls:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq, u
+
+
+def fetch_europepmc_pdf_urls(pmid: str, epmc: ApiClient) -> Tuple[List[str], str]:
+    u = f"{EUROPEPMC_BASE}/search?query=EXT_ID:{requests.utils.quote(pmid)}%20AND%20SRC:MED&format=json&pageSize=1"
+    j = epmc.get_json(u)
+    items = (j.get("resultList") or {}).get("result") or []
+    urls: List[str] = []
+    if items:
+        for ft in items[0].get("fullTextUrlList", {}).get("fullTextUrl", []) or []:
+            if str(ft.get("documentStyle", "")).lower() == "pdf" and ft.get("url"):
+                urls.append(ft["url"])
+    return urls, u
 
 
 def ensure_pdf_valid(path: Path, min_size: int = 30 * 1024) -> Tuple[bool, str]:
     if not path.exists() or path.stat().st_size < min_size:
         return False, "слишком маленький файл или отсутствует"
     with path.open("rb") as f:
-        head = f.read(5)
-    if head != b"%PDF-":
-        return False, "файл не начинается с %PDF"
+        if f.read(5) != b"%PDF-":
+            return False, "файл не начинается с %PDF"
     return True, "OK"
+
+
+def download_pdf(url: str, path: Path, timeout: int) -> Tuple[bool, str, int, str]:
+    try:
+        with requests.get(url, timeout=timeout, stream=True, allow_redirects=True) as r:
+            code = r.status_code
+            ctype = (r.headers.get("Content-Type", "") or "").lower()
+            if code >= 400:
+                return False, f"HTTP {code}", code, ctype
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("wb") as f:
+                for ch in r.iter_content(chunk_size=65536):
+                    if ch:
+                        f.write(ch)
+        ok, reason = ensure_pdf_valid(path)
+        if not ok:
+            path.unlink(missing_ok=True)
+            return False, reason, code, ctype
+        return True, "OK", code, ctype
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        return False, str(exc), -1, ""
 
 
 def save_abstract(path: Path, text: str) -> bool:
@@ -316,476 +621,316 @@ def save_abstract(path: Path, text: str) -> bool:
     return True
 
 
-def crossref_to_text(raw: str) -> str:
-    t = re.sub(r"<[^>]+>", " ", raw or "")
-    return normalize_text(t)
-
-
-def fetch_openalex_abstract(row: Dict[str, str], oa: ApiClient, api_key: str, mailto: str) -> Tuple[str, str, str]:
-    openalex_id = normalize_text(row.get("openalex_id", ""))
-    doi = normalize_text(row.get("doi", "")).replace("https://doi.org/", "")
-    params = []
-    if api_key:
-        params.append(f"api_key={requests.utils.quote(api_key)}")
-    if mailto:
-        params.append(f"mailto={requests.utils.quote(mailto)}")
-    q = ("?" + "&".join(params)) if params else ""
-
-    urls: List[str] = []
-    if openalex_id:
-        if openalex_id.startswith("http"):
-            urls.append(f"{OPENALEX_BASE}/works/{requests.utils.quote(openalex_id.split('/')[-1], safe='')}{q}")
-        else:
-            urls.append(f"{OPENALEX_BASE}/works/{requests.utils.quote(openalex_id, safe='')}{q}")
-    if doi:
-        urls.append(f"{OPENALEX_BASE}/works/https://doi.org/{requests.utils.quote(doi, safe='')}{q}")
-
-    for u in urls:
-        j = oa.get_json(u)
-        text = undo_inverted_index(j.get("abstract_inverted_index") or {})
-        if text:
-            return text, "openalex_inverted_index", u
-    return "", "", urls[0] if urls else ""
-
-
-def fetch_europepmc_abstract(pmid: str, epmc: ApiClient) -> Tuple[str, str]:
-    u = f"{EUROPEPMC_BASE}/search?query=EXT_ID:{requests.utils.quote(pmid)}%20AND%20SRC:MED&format=json&pageSize=1"
-    j = epmc.get_json(u)
-    results = (j.get("resultList") or {}).get("result") or []
-    if results:
-        return normalize_text(results[0].get("abstractText", "")), u
-    return "", u
-
-
-def fetch_crossref_abstract(doi: str, cr: ApiClient, mailto: str) -> Tuple[str, str]:
-    headers = {"User-Agent": f"IDEA_PIPELINE_C1/1.0 (mailto:{mailto})"}
-    u = f"{CROSSREF_BASE}/{requests.utils.quote(doi, safe='')}?mailto={requests.utils.quote(mailto)}"
-    j = cr.get_json(u, headers=headers)
-    raw = ((j.get("message") or {}).get("abstract") or "")
-    return crossref_to_text(raw), u
-
-
-def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str) -> Tuple[List[str], str, str]:
-    u = f"{UNPAYWALL_BASE}/{requests.utils.quote(doi, safe='')}?email={requests.utils.quote(email)}"
-    j = up.get_json(u)
-    urls: List[str] = []
-    best_url = ""
-    best = j.get("best_oa_location") or {}
-    if best.get("url_for_pdf"):
-        best_url = best["url_for_pdf"]
-        urls.append(best_url)
-    for loc in j.get("oa_locations") or []:
-        x = normalize_text(loc.get("url_for_pdf", ""))
-        if x:
-            urls.append(x)
-    seen = set()
-    uniq = []
-    for x in urls:
-        if x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return uniq, u, best_url
-
-
-def fetch_europepmc_pdf_urls(pmid: str, epmc: ApiClient) -> Tuple[List[str], str]:
-    u = f"{EUROPEPMC_BASE}/search?query=EXT_ID:{requests.utils.quote(pmid)}%20AND%20SRC:MED&format=json&pageSize=1"
-    j = epmc.get_json(u)
-    results = (j.get("resultList") or {}).get("result") or []
-    urls: List[str] = []
-    if results:
-        for ft in results[0].get("fullTextUrlList", {}).get("fullTextUrl", []) or []:
-            if str(ft.get("documentStyle", "")).lower() == "pdf" and ft.get("url"):
-                urls.append(ft["url"])
-    return urls, u
-
-
-def download_pdf(url: str, path: Path, timeout: int, logger: RunLogger, min_size: int = 30 * 1024) -> Tuple[bool, str, int, str]:
-    try:
-        with requests.get(url, timeout=timeout, stream=True, allow_redirects=True) as r:
-            code = r.status_code
-            if code >= 400:
-                return False, f"HTTP {code}", code, r.headers.get("Content-Type", "")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
-            ctype = (r.headers.get("Content-Type", "") or "").lower()
-            ok_magic, reason_magic = ensure_pdf_valid(path, min_size=min_size)
-            if "pdf" not in ctype and not ok_magic:
-                path.unlink(missing_ok=True)
-                return False, f"не PDF: {reason_magic}; Content-Type={ctype}", code, ctype
-            if not ok_magic:
-                path.unlink(missing_ok=True)
-                return False, reason_magic, code, ctype
-            return True, "OK", code, ctype
-    except Exception as exc:
-        path.unlink(missing_ok=True)
-        logger.warn(f"Скачивание PDF не удалось: {exc}")
-        return False, str(exc), -1, ""
-
-
-def write_jsonl(path: Path, rows: Iterable[Dict[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-
-def write_errors_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    cols = ["paper_id", "step", "url", "http_code", "message", "doi", "openalex_id"]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in cols})
+def pick_without_llm(candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> List[Dict[str, Any]]:
+    ordered = sorted(candidates, key=lambda x: (-x["score"], -x["cited_by"], x["paper_id"]))
+    abs_ids = {x["paper_id"] for x in ordered[:max_abs]}
+    pdf_ids = {x["paper_id"] for x in ordered if x.get("oa_pdf_url") or x.get("doi")}
+    pdf_ids = set(list(pdf_ids)[:max_pdf])
+    out = []
+    for c in ordered:
+        out.append({**c, "select_for_abstract": 1 if c["paper_id"] in abs_ids else 0, "select_for_pdf": 1 if c["paper_id"] in pdf_ids else 0, "reason": "автовыбор без ChatGPT"})
+    return out
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Stage C1: Selection + Harvest (abstracts + OA PDFs)")
-    ap.add_argument("--idea-dir", default="", help="Путь к IDEA-* (опционально)")
+    ap = argparse.ArgumentParser(description="Stage C1: Selection + Harvest (Selection + ChatGPT + Harvest)")
+    ap.add_argument("--idea-dir", default="")
+    ap.add_argument("--screening", choices=["chatgpt", "none"], default="chatgpt")
+    ap.add_argument("--max-candidates", type=int, default=400)
     ap.add_argument("--max-abstracts", type=int, default=120)
     ap.add_argument("--max-pdfs", type=int, default=40)
+    ap.add_argument("--timeout", type=int, default=35)
     ap.add_argument("--force", action="store_true")
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--timeout", type=int, default=30)
     ap.add_argument("--rps-openalex", type=float, default=2.0)
     ap.add_argument("--rps-unpaywall", type=float, default=1.5)
     ap.add_argument("--rps-crossref", type=float, default=1.0)
     ap.add_argument("--rps-europepmc", type=float, default=1.5)
+    ap.add_argument("--rps-s2", type=float, default=1.0)
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
     idea_dir = find_idea_dir(root, args.idea_dir or None)
-
     logs_dir = idea_dir / "logs"
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = logs_dir / f"moduleC1_{now}.log"
-    logger = RunLogger(log_path)
+    in_dir = idea_dir / "in"
+    papers_dir = in_dir / "papers"
+    manifests_dir = papers_dir / "manifests"
+    out_dir = idea_dir / "out"
+    abstracts_dir = papers_dir / "abstracts"
+    pdf_dir = papers_dir / "pdfs"
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_log = logs_dir / f"moduleC1_{ts}.log"
+    last_log = logs_dir / "moduleC1_LAST.log"
+    logger = RunLogger(run_log)
+
+    manifest_rows: List[Dict[str, Any]] = []
+    error_rows: List[Dict[str, Any]] = []
 
     try:
-        logger.info("=== Stage C1: Отбор и сбор (абстракты + OA PDF) ===")
+        logger.info("=== Stage C1: Selection + Harvest ===")
         logger.info(f"IDEA_DIR={idea_dir}")
 
         secrets = load_secrets(root)
-
-        out_dir = idea_dir / "out"
-        in_papers = idea_dir / "in" / "papers"
-        abstracts_dir = in_papers / "abstracts"
-        pdfs_dir = in_papers / "pdfs"
-        manifests_dir = in_papers / "manifests"
-
         corpus_path = out_dir / "corpus.csv"
-        structured_path = out_dir / "structured_idea.json"
         if not corpus_path.exists():
             raise FileNotFoundError(f"Не найден обязательный файл: {corpus_path}")
 
         rows = load_corpus(corpus_path)
-        logger.info(f"Найдено записей в корпусе: {len(rows)}")
-
-        keywords = extract_keywords(structured_path)
-        if keywords:
-            logger.info(f"Загружены ключевые слова из structured_idea.json: {len(keywords)}")
-        else:
-            logger.warn("structured_idea.json не найден/пустой: отбор только по score/cited_by/OA")
-
-        selected = choose_selection(rows, keywords, args.max_abstracts, args.max_pdfs)
-        write_selection_csv(in_papers / "selection.csv", selected)
-
-        selected_abs = [x for x in selected if x["select_for_abstract"] == 1]
-        selected_pdf = [x for x in selected if x["select_for_pdf"] == 1]
-        logger.info(f"Выбрано: abstracts={len(selected_abs)}, pdfs={len(selected_pdf)}")
-
-        if args.dry_run:
-            logger.info("Режим --dry-run: сетевые запросы пропущены.")
-            summary = (
-                f"ИТОГ C1 (dry-run)\n"
-                f"- найдено в корпусе: {len(rows)}\n"
-                f"- выбрано abstracts: {len(selected_abs)}\n"
-                f"- выбрано pdfs: {len(selected_pdf)}\n"
-                f"- selection: {in_papers / 'selection.csv'}\n"
-            )
-            print(summary)
-            (out_dir / "harvest_report.md").write_text("# Stage C1 (dry-run)\n\n" + summary, encoding="utf-8")
-            (out_dir / "prisma_c1.md").write_text(
-                f"# PRISMA C1 (dry-run)\n\n- selected_for_abstract: {len(selected_abs)}\n- selected_for_pdf: {len(selected_pdf)}\n",
-                encoding="utf-8",
-            )
-            shutil.copyfile(log_path, logs_dir / "moduleC1_LAST.log")
-            return 0
+        idea_text, structured, keywords = extract_idea_context(idea_dir)
 
         oa = ApiClient("OpenAlex", args.rps_openalex, args.timeout, logger)
         up = ApiClient("Unpaywall", args.rps_unpaywall, args.timeout, logger)
         cr = ApiClient("Crossref", args.rps_crossref, args.timeout, logger)
         epmc = ApiClient("EuropePMC", args.rps_europepmc, args.timeout, logger)
+        s2 = ApiClient("SemanticScholar", args.rps_s2, args.timeout, logger)
 
-        papers_rows: List[Dict[str, Any]] = []
-        manifest_rows: List[Dict[str, Any]] = []
-        errors_rows: List[Dict[str, Any]] = []
+        candidates, rejected, stats = preclean_corpus(rows, oa, secrets, keywords, logger, args.max_candidates)
+        write_json(papers_dir / "preselection_candidates.json", candidates)
+        write_csv(papers_dir / "preselection_rejected.csv", rejected, ["index", "title", "doi", "openalex_id", "reason"])
+        logger.info(f"Корпус={stats['corpus_n']}, после дедупа={stats['after_dedup_n']}, после доменного фильтра={stats['after_domain_filter_n']}")
+
+        prompt_path = in_dir / "c1_screen_prompt.txt"
+        resp_path = in_dir / "c1_screen_response.json"
+
+        selected: List[Dict[str, Any]] = []
+
+        if args.screening == "none":
+            selected = pick_without_llm(candidates, args.max_abstracts, args.max_pdfs)
+            logger.warn("Режим без ChatGPT включён вручную (--screening none)")
+        else:
+            if not resp_path.exists():
+                prompt = generate_screening_prompt(idea_text, structured, candidates, args.max_abstracts, args.max_pdfs)
+                prompt_path.write_text(prompt, encoding="utf-8")
+                copied = copy_to_clipboard(prompt)
+                logger.info(f"Prompt для ChatGPT создан: {prompt_path}")
+                logger.info("Режим ожидания ответа ChatGPT (это нормальный сценарий)")
+                print("\nШаги:\n1) Вставьте prompt в ChatGPT.\n2) Получите строго JSON-ответ.\n3) Сохраните его как in/c1_screen_response.json и запустите RUN_C1 ещё раз.\n")
+                if copied:
+                    print("Prompt также скопирован в буфер обмена.")
+                return 2
+
+            raw = parse_screening_response(resp_path)
+            selected, validation_errors = validate_screening_response(raw, candidates, args.max_abstracts, args.max_pdfs)
+            if validation_errors:
+                invalid_path = in_dir / "c1_screen_response.INVALID.json"
+                invalid_path.write_text(resp_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+                msg = "\n".join(f"- {e}" for e in validation_errors)
+                logger.err("Невалидный JSON-ответ ChatGPT. Исправьте и запустите снова.")
+                logger.err(msg)
+                print(f"\nОтвет не прошёл валидацию. Копия сохранена: {invalid_path}\n{msg}\n")
+                return 1
+
+        write_csv(
+            papers_dir / "selection.csv",
+            selected,
+            ["paper_id", "title", "year", "doi", "openalex_id", "select_for_abstract", "select_for_pdf", "reason", "domain", "field", "subfield"],
+        )
+
+        selected_abs = [x for x in selected if x["select_for_abstract"] == 1]
+        selected_pdf = [x for x in selected if x["select_for_pdf"] == 1]
 
         abs_ok = 0
         pdf_ok = 0
         reason_counter = Counter()
 
-        by_id = {x["paper_id"]: x for x in selected}
-
         for item in selected:
-            row = item["source_row"]
             pid = item["paper_id"]
+            row = item.get("source_row") or {}
             abs_path = abstracts_dir / f"{pid}.txt"
-            pdf_path = pdfs_dir / f"{pid}.pdf"
+            pdf_path = pdf_dir / f"{pid}.pdf"
 
-            paper_state: Dict[str, Any] = {
-                "paper_id": pid,
-                "doi": normalize_text(row.get("doi", "")),
-                "openalex_id": normalize_text(row.get("openalex_id", "")),
-                "pmid": normalize_text(row.get("pmid", "")),
-                "title": normalize_text(row.get("title", "")),
-                "year": normalize_text(row.get("year", "")),
-                "select_for_abstract": item["select_for_abstract"],
-                "select_for_pdf": item["select_for_pdf"],
-                "reason": item["reason"],
-                "source_abstract": "",
-                "abstract_status": "not_selected",
-                "pdf_status": "not_selected",
-            }
-
-            # ---------- ABSTRACT ----------
             if item["select_for_abstract"] == 1:
-                paper_state["abstract_status"] = "failed"
-                if abs_path.exists() and abs_path.stat().st_size > 10 and not args.force:
+                if abs_path.exists() and abs_path.stat().st_size > 20 and not args.force:
                     abs_ok += 1
-                    paper_state["source_abstract"] = "resume_cached"
-                    paper_state["abstract_status"] = "ok"
+                    manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "resume_cached", "source": "local", "url": str(abs_path)})
                 else:
-                    corpus_abs = normalize_text(row.get("abstract", ""))
-                    if len(corpus_abs) > 200:
-                        if save_abstract(abs_path, corpus_abs):
-                            abs_ok += 1
-                            paper_state["source_abstract"] = "corpus"
-                            paper_state["abstract_status"] = "ok"
-                    else:
+                    got = False
+                    corpus_abs = normalize_text((row or {}).get("abstract", ""))
+                    if len(corpus_abs) >= 200 and save_abstract(abs_path, corpus_abs):
+                        got = True
+                        abs_ok += 1
+                        manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "corpus", "url": ""})
+                    if not got:
                         try:
-                            txt, src, used_url = fetch_openalex_abstract(
-                                row,
-                                oa,
-                                secrets.get("OPENALEX_API_KEY", ""),
-                                secrets.get("OPENALEX_MAILTO", ""),
-                            )
-                            if txt and save_abstract(abs_path, txt):
+                            txt, u = fetch_openalex_abstract(item, oa, secrets)
+                            if save_abstract(abs_path, txt):
+                                got = True
                                 abs_ok += 1
-                                paper_state["source_abstract"] = src
-                                paper_state["abstract_status"] = "ok"
-                            else:
-                                raise RuntimeError("в OpenAlex нет abstract_inverted_index")
+                                manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "openalex_inverted_index", "url": u})
                         except Exception as exc:
-                            errors_rows.append(
-                                {
-                                    "paper_id": pid,
-                                    "step": "openalex",
-                                    "url": locals().get("used_url", ""),
-                                    "http_code": "",
-                                    "message": f"{exc}",
-                                    "doi": row.get("doi", ""),
-                                    "openalex_id": row.get("openalex_id", ""),
-                                }
-                            )
-                            pmid = normalize_text(row.get("pmid", ""))
-                            got_abs = False
-                            if pmid:
-                                try:
-                                    txt, epmc_url = fetch_europepmc_abstract(pmid, epmc)
-                                    if txt and save_abstract(abs_path, txt):
-                                        abs_ok += 1
-                                        paper_state["source_abstract"] = "europepmc"
-                                        paper_state["abstract_status"] = "ok"
-                                        got_abs = True
-                                    else:
-                                        raise RuntimeError("Europe PMC не вернул abstract")
-                                except Exception as exc2:
-                                    errors_rows.append(
-                                        {
-                                            "paper_id": pid,
-                                            "step": "europepmc",
-                                            "url": locals().get("epmc_url", ""),
-                                            "http_code": "",
-                                            "message": f"{exc2}",
-                                            "doi": row.get("doi", ""),
-                                            "openalex_id": row.get("openalex_id", ""),
-                                        }
-                                    )
-                            if (not got_abs) and normalize_text(row.get("doi", "")) and secrets.get("CROSSREF_MAILTO"):
-                                try:
-                                    txt, cr_url = fetch_crossref_abstract(normalize_text(row.get("doi", "")), cr, secrets["CROSSREF_MAILTO"])
-                                    if txt and save_abstract(abs_path, txt):
-                                        abs_ok += 1
-                                        paper_state["source_abstract"] = "crossref"
-                                        paper_state["abstract_status"] = "ok"
-                                    else:
-                                        raise RuntimeError("Crossref не содержит abstract")
-                                except Exception as exc3:
-                                    errors_rows.append(
-                                        {
-                                            "paper_id": pid,
-                                            "step": "crossref",
-                                            "url": locals().get("cr_url", ""),
-                                            "http_code": "",
-                                            "message": f"{exc3}",
-                                            "doi": row.get("doi", ""),
-                                            "openalex_id": row.get("openalex_id", ""),
-                                        }
-                                    )
-                if paper_state["abstract_status"] != "ok":
-                    reason_counter["не удалось получить абстракт"] += 1
+                            error_rows.append({"paper_id": pid, "step": "openalex_abstract", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                    if not got and item.get("pmid"):
+                        try:
+                            txt, u = fetch_europepmc_abstract(item.get("pmid", ""), epmc)
+                            if save_abstract(abs_path, txt):
+                                got = True
+                                abs_ok += 1
+                                manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "europepmc", "url": u})
+                        except Exception as exc:
+                            error_rows.append({"paper_id": pid, "step": "europepmc_abstract", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                    if not got and item.get("doi") and secrets.get("CROSSREF_MAILTO"):
+                        try:
+                            txt, u = fetch_crossref_abstract(item["doi"], cr, secrets["CROSSREF_MAILTO"])
+                            if save_abstract(abs_path, txt):
+                                got = True
+                                abs_ok += 1
+                                manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "crossref", "url": u})
+                        except Exception as exc:
+                            error_rows.append({"paper_id": pid, "step": "crossref_abstract", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                    if not got and (item.get("doi") or item.get("title")):
+                        try:
+                            sj, u = fetch_semantic_scholar(item.get("doi", ""), item.get("title", ""), s2, secrets.get("S2_API_KEY", ""))
+                            if save_abstract(abs_path, normalize_text(sj.get("abstract", ""))):
+                                got = True
+                                abs_ok += 1
+                                manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "semantic_scholar", "url": u})
+                        except Exception as exc:
+                            error_rows.append({"paper_id": pid, "step": "semantic_scholar_abstract", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                    if not got:
+                        reason_counter["не удалось получить абстракт"] += 1
 
-            # ---------- PDF ----------
             if item["select_for_pdf"] == 1:
-                paper_state["pdf_status"] = "failed"
                 if pdf_path.exists() and not args.force:
-                    ok_pdf, _ = ensure_pdf_valid(pdf_path)
-                    if ok_pdf:
+                    ok, _ = ensure_pdf_valid(pdf_path)
+                    if ok:
                         pdf_ok += 1
-                        paper_state["pdf_status"] = "ok"
-                        manifest_rows.append({"paper_id": pid, "step": "download_pdf", "status": "resume_cached", "url": str(pdf_path), "http_code": 200})
-                if paper_state["pdf_status"] != "ok":
-                    pdf_candidates: List[Tuple[str, str]] = []
-                    c_oa = normalize_text(row.get("oa_pdf_url", ""))
-                    if c_oa:
-                        pdf_candidates.append(("corpus_oa_pdf_url", c_oa))
+                        manifest_rows.append({"paper_id": pid, "step": "pdf", "status": "resume_cached", "source": "local", "url": str(pdf_path)})
+                        continue
 
-                    doi = normalize_text(row.get("doi", ""))
-                    pmid = normalize_text(row.get("pmid", ""))
-                    best_html = normalize_text(row.get("best_url", ""))
-                    if doi and secrets.get("UNPAYWALL_EMAIL"):
-                        try:
-                            urls, up_url, best = fetch_unpaywall_pdf_urls(doi, up, secrets["UNPAYWALL_EMAIL"])
-                            for u in urls:
-                                pdf_candidates.append(("unpaywall", u))
-                            if best and not best_html:
-                                best_html = best
-                        except Exception as exc:
-                            errors_rows.append(
-                                {"paper_id": pid, "step": "unpaywall", "url": locals().get("up_url", ""), "http_code": "", "message": str(exc), "doi": doi, "openalex_id": row.get("openalex_id", "")}
-                            )
-                    if pmid:
-                        try:
-                            epmc_urls, epmc_url2 = fetch_europepmc_pdf_urls(pmid, epmc)
-                            for u in epmc_urls:
-                                pdf_candidates.append(("europepmc", u))
-                        except Exception as exc:
-                            errors_rows.append(
-                                {"paper_id": pid, "step": "europepmc_pdf", "url": locals().get("epmc_url2", ""), "http_code": "", "message": str(exc), "doi": doi, "openalex_id": row.get("openalex_id", "")}
-                            )
+                urls: List[Tuple[str, str]] = []
+                if item.get("oa_pdf_url"):
+                    urls.append(("corpus", item["oa_pdf_url"]))
+                if item.get("doi") and secrets.get("UNPAYWALL_EMAIL"):
+                    try:
+                        ulist, src = fetch_unpaywall_pdf_urls(item["doi"], up, secrets["UNPAYWALL_EMAIL"])
+                        urls.extend(("unpaywall", x) for x in ulist)
+                        manifest_rows.append({"paper_id": pid, "step": "unpaywall_lookup", "status": "ok", "source": "unpaywall", "url": src})
+                    except Exception as exc:
+                        error_rows.append({"paper_id": pid, "step": "unpaywall_lookup", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                if item.get("pmid"):
+                    try:
+                        epdfs, src = fetch_europepmc_pdf_urls(item["pmid"], epmc)
+                        urls.extend(("europepmc", x) for x in epdfs)
+                        manifest_rows.append({"paper_id": pid, "step": "europepmc_lookup", "status": "ok", "source": "europepmc", "url": src})
+                    except Exception as exc:
+                        error_rows.append({"paper_id": pid, "step": "europepmc_pdf_lookup", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                try:
+                    sj, src = fetch_semantic_scholar(item.get("doi", ""), item.get("title", ""), s2, secrets.get("S2_API_KEY", ""))
+                    s2_pdf = normalize_text((sj.get("openAccessPdf") or {}).get("url", ""))
+                    if s2_pdf:
+                        urls.append(("semantic_scholar", s2_pdf))
+                    manifest_rows.append({"paper_id": pid, "step": "semantic_scholar_lookup", "status": "ok", "source": "semantic_scholar", "url": src})
+                except Exception as exc:
+                    error_rows.append({"paper_id": pid, "step": "semantic_scholar_pdf_lookup", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
 
-                    seen = set()
-                    uniq_candidates = []
-                    for src, u in pdf_candidates:
-                        if u and u not in seen:
-                            seen.add(u)
-                            uniq_candidates.append((src, u))
+                uniq: List[Tuple[str, str]] = []
+                seen = set()
+                for src, u in urls:
+                    if u and u not in seen:
+                        seen.add(u)
+                        uniq.append((src, u))
 
-                    downloaded = False
-                    for src, u in uniq_candidates:
-                        ok, msg, http_code, ctype = download_pdf(u, pdf_path, args.timeout, logger)
-                        manifest_rows.append(
-                            {
-                                "paper_id": pid,
-                                "step": "download_pdf",
-                                "status": "ok" if ok else "failed",
-                                "source": src,
-                                "url": u,
-                                "http_code": http_code,
-                                "content_type": ctype,
-                                "size": pdf_path.stat().st_size if pdf_path.exists() else 0,
-                                "sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest() if ok and pdf_path.exists() else "",
-                            }
-                        )
-                        if ok:
-                            downloaded = True
-                            pdf_ok += 1
-                            paper_state["pdf_status"] = "ok"
-                            break
-                        errors_rows.append(
-                            {
-                                "paper_id": pid,
-                                "step": "download_pdf",
-                                "url": u,
-                                "http_code": http_code,
-                                "message": msg,
-                                "doi": doi,
-                                "openalex_id": row.get("openalex_id", ""),
-                            }
-                        )
-                    if not downloaded:
-                        reason_counter["не удалось скачать OA PDF"] += 1
-                        manifest_rows.append({"paper_id": pid, "step": "best_url", "status": "saved", "url": best_html, "http_code": ""})
+                got_pdf = False
+                for src, u in uniq:
+                    ok, msg, code, ctype = download_pdf(u, pdf_path, args.timeout)
+                    manifest_rows.append(
+                        {
+                            "paper_id": pid,
+                            "step": "download_pdf",
+                            "status": "ok" if ok else "failed",
+                            "source": src,
+                            "url": u,
+                            "http_code": code,
+                            "content_type": ctype,
+                            "size": pdf_path.stat().st_size if ok and pdf_path.exists() else 0,
+                            "sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest() if ok and pdf_path.exists() else "",
+                        }
+                    )
+                    if ok:
+                        got_pdf = True
+                        pdf_ok += 1
+                        break
+                    error_rows.append({"paper_id": pid, "step": "download_pdf", "url": u, "http_code": code, "message": msg, "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                if not got_pdf:
+                    reason_counter["не удалось скачать OA PDF"] += 1
 
-            papers_rows.append(paper_state)
-
-        write_jsonl(in_papers / "papers.jsonl", papers_rows)
         write_jsonl(manifests_dir / "manifest.jsonl", manifest_rows)
-        write_errors_csv(manifests_dir / "errors.csv", errors_rows)
+        write_csv(manifests_dir / "errors.csv", error_rows, ["paper_id", "step", "url", "http_code", "message", "doi", "openalex_id"])
 
-        fail_top = reason_counter.most_common(5)
-        fail_lines = [f"- {k}: {v}" for k, v in fail_top] if fail_top else ["- нет"]
+        status = "OK" if not error_rows else "DEGRADED"
+        top5 = reason_counter.most_common(5)
+        top_txt = "\n".join([f"- {k}: {v}" for k, v in top5]) if top5 else "- нет"
 
         report = (
-            "# Stage C1 — Отчёт по сбору\n\n"
-            f"- Найдено в корпусе: **{len(rows)}**\n"
-            f"- Выбрано abstracts: **{len(selected_abs)}**\n"
-            f"- Выбрано pdfs: **{len(selected_pdf)}**\n"
-            f"- Успешно abstracts: **{abs_ok}**\n"
-            f"- Успешно pdfs: **{pdf_ok}**\n"
-            f"- Ошибок: **{len(errors_rows)}**\n\n"
-            "## Топ причин\n"
-            + "\n".join(fail_lines)
-            + "\n"
+            "# Stage C1 — Harvest report\n\n"
+            f"Статус: **{status}**\n\n"
+            f"- corpus: {stats['corpus_n']}\n"
+            f"- after dedup: {stats['after_dedup_n']}\n"
+            f"- after domain filter: {stats['after_domain_filter_n']}\n"
+            f"- candidates sent to ChatGPT: {len(candidates)}\n"
+            f"- selected abstracts: {len(selected_abs)}\n"
+            f"- selected pdfs: {len(selected_pdf)}\n"
+            f"- downloaded abstracts_ok: {abs_ok}\n"
+            f"- downloaded pdfs_ok: {pdf_ok}\n"
+            f"- errors total: {len(error_rows)}\n\n"
+            "## Top-5 причин ошибок\n"
+            f"{top_txt}\n"
         )
         (out_dir / "harvest_report.md").write_text(report, encoding="utf-8")
 
         prisma = (
-            "# PRISMA C1 (кратко)\n\n"
+            "# PRISMA C1\n\n"
+            f"- status: {status}\n"
+            f"- corpus: {stats['corpus_n']}\n"
+            f"- after_dedup: {stats['after_dedup_n']}\n"
+            f"- after_domain_filter: {stats['after_domain_filter_n']}\n"
             f"- selected_for_abstract: {len(selected_abs)}\n"
             f"- selected_for_pdf: {len(selected_pdf)}\n"
             f"- downloaded_abstract_ok: {abs_ok}\n"
             f"- downloaded_pdf_ok: {pdf_ok}\n"
-            f"- failed_total: {len(errors_rows)}\n"
+            f"- errors_total: {len(error_rows)}\n"
         )
         (out_dir / "prisma_c1.md").write_text(prisma, encoding="utf-8")
 
-        summary_txt = (
-            "ИТОГ Stage C1\n"
-            f"- найдено в корпусе: {len(rows)}\n"
-            f"- выбрано: abstracts={len(selected_abs)}, pdfs={len(selected_pdf)}\n"
-            f"- скачано успешно: abstracts_ok={abs_ok}, pdfs_ok={pdf_ok}\n"
-            f"- главные причины провалов:\n" + "\n".join(fail_lines) + "\n"
-            f"- LAST_LOG: {logs_dir / 'moduleC1_LAST.log'}\n"
+        summary = (
+            "\nИТОГ Stage C1\n"
+            f"- corpus N: {stats['corpus_n']}\n"
+            f"- after dedup N: {stats['after_dedup_n']}\n"
+            f"- after domain filter N: {stats['after_domain_filter_n']}\n"
+            f"- candidates sent to ChatGPT N: {len(candidates)}\n"
+            f"- selected abstracts N: {len(selected_abs)}\n"
+            f"- selected pdfs N: {len(selected_pdf)}\n"
+            f"- downloaded abstracts_ok: {abs_ok}\n"
+            f"- downloaded pdfs_ok: {pdf_ok}\n"
+            f"- top-5 error reasons:\n{top_txt}\n"
             f"- errors.csv: {manifests_dir / 'errors.csv'}\n"
+            f"- LAST.log: {last_log}\n"
+            f"- статус: {status}\n"
         )
-        print(summary_txt)
+        print(summary)
 
-        shutil.copyfile(log_path, logs_dir / "moduleC1_LAST.log")
-
-        launcher_dir = root / "launcher_logs"
-        launcher_dir.mkdir(exist_ok=True)
-        (launcher_dir / "LAST_LOG.txt").write_text(
-            f"Stage C1\nIDEA={idea_dir}\nLOG={logs_dir / 'moduleC1_LAST.log'}\nERRORS={manifests_dir / 'errors.csv'}\n",
+        (root / "launcher_logs").mkdir(exist_ok=True)
+        (root / "launcher_logs" / "LAST_LOG.txt").write_text(
+            f"Stage C1\nIDEA={idea_dir}\nLOG={last_log}\nERRORS={manifests_dir / 'errors.csv'}\n",
             encoding="utf-8",
         )
-
-        logger.info("Stage C1 завершён.")
+        shutil.copyfile(run_log, last_log)
+        logger.info(f"Stage C1 завершен. Статус={status}")
         return 0
+
     except Exception as exc:
-        logger.err(str(exc))
-        try:
-            shutil.copyfile(log_path, logs_dir / "moduleC1_LAST.log")
-        except Exception:
-            pass
+        logger.err(f"Критическая ошибка Stage C1: {exc}")
+        manifests_dir.mkdir(parents=True, exist_ok=True)
+        if not (manifests_dir / "errors.csv").exists():
+            write_csv(manifests_dir / "errors.csv", [{"paper_id": "", "step": "fatal", "url": "", "http_code": "", "message": str(exc), "doi": "", "openalex_id": ""}], ["paper_id", "step", "url", "http_code", "message", "doi", "openalex_id"])
         return 1
     finally:
+        try:
+            shutil.copyfile(run_log, last_log)
+        except Exception:
+            pass
         logger.close()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

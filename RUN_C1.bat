@@ -24,15 +24,17 @@ set "IDEA_DIR="
 if not "%~1"=="" set "IDEA_DIR=%~1"
 
 if "%IDEA_DIR%"=="" (
-  "%PY%" "%ROOT%tools\run_c1.py"
+  "%PY%" "%ROOT%tools\run_c1.py" --screening chatgpt
 ) else (
-  "%PY%" "%ROOT%tools\run_c1.py" --idea-dir "%IDEA_DIR%"
+  "%PY%" "%ROOT%tools\run_c1.py" --screening chatgpt --idea-dir "%IDEA_DIR%"
 )
 set "RC=%ERRORLEVEL%"
 
 echo.
 if "%RC%"=="0" (
   echo [OK] Stage C1 завершен успешно.
+) else if "%RC%"=="2" (
+  echo [WAIT] Ожидание ответа ChatGPT. Это нормальный шаг первого запуска.
 ) else (
   echo [ERR] Stage C1 завершился с ошибкой. ExitCode=%RC%
   echo [HINT] Проверьте launcher_logs\LAST_LOG.txt и logs\moduleC1_LAST.log
