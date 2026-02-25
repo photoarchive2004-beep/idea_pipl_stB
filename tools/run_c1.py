@@ -413,61 +413,73 @@ def preclean_corpus(rows: List[Dict[str, str]], oa: ApiClient, secrets: Dict[str
     return candidates, rejected, stats
 
 
-def generate_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
-    n_candidates = len(candidates)
-    min_target = min(max_abs, min(100, max(40, round(0.35 * n_candidates))))
-    reduced_candidates = [
-        {
-            "paper_id": c["paper_id"],
-            "title": c["title"],
-            "year": c["year"],
-            "doi": c["doi"],
-            "venue": c["venue"],
-            "first_author": c.get("first_author", ""),
-            "abstract_snippet": c["abstract_snippet"],
-            "domain": c.get("domain", ""),
-            "field": c.get("field", ""),
-            "subfield": c.get("subfield", ""),
-            "downloadability_hint": c.get("downloadability_hint", "NONE"),
-            "oa_pdf_candidates": c.get("oa_pdf_candidates", []),
-        }
-        for c in candidates
-    ]
+def _short_structured_idea(structured: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in ["keywords_for_search", "claims"]:
+        val = structured.get(key)
+        if isinstance(val, list):
+            out[key] = [normalize_text(str(x)) for x in val if normalize_text(str(x))][:12]
+        elif isinstance(val, str) and normalize_text(val):
+            out[key] = normalize_text(val)
+    return out
+
+
+def generate_light_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
+    domain_counter = Counter(normalize_text(c.get("domain", "")).lower() for c in candidates if normalize_text(c.get("domain", "")))
+    field_counter = Counter(normalize_text(c.get("field", "")).lower() for c in candidates if normalize_text(c.get("field", "")))
+    payload = {
+        "idea_text": normalize_text(idea_text)[:4000],
+        "structured_idea_short": _short_structured_idea(structured),
+        "candidates_stats": {
+            "total_candidates": len(candidates),
+            "top_domains": domain_counter.most_common(10),
+            "top_fields": field_counter.most_common(10),
+        },
+        "required_response_contract": {
+            "include_keywords": ["..."],
+            "exclude_keywords": ["..."],
+            "allowed_domains": ["..."] ,
+            "blocked_domains": ["..."],
+            "target_abstracts": max_abs,
+            "target_pdfs": max_pdf,
+            "notes": "optional"
+        },
+        "rules": [
+            "Верни только JSON-объект без markdown.",
+            "Не возвращай paper_id и списки статей: только правила фильтрации.",
+            "include_keywords: 5-20, exclude_keywords: 5-30.",
+            f"target_abstracts <= {max_abs}, target_pdfs <= {max_pdf}, target_pdfs <= target_abstracts.",
+            "Учитывай неоднозначные аббревиатуры и добавляй исключающие keywords/domain для нерелевантных значений.",
+        ],
+    }
+    return "LIGHT screening для C1: сформируй фильтры для автоматического отбора.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def generate_full_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
+    reduced_candidates = [{
+        "paper_id": c["paper_id"],
+        "title": c["title"],
+        "year": c["year"],
+        "doi": c["doi"],
+        "venue": c["venue"],
+        "first_author": c.get("first_author", ""),
+        "abstract_snippet": c["abstract_snippet"],
+        "domain": c.get("domain", ""),
+        "field": c.get("field", ""),
+        "subfield": c.get("subfield", ""),
+    } for c in candidates]
     payload = {
         "idea_text": idea_text,
         "structured_idea": structured,
         "max_abstracts": max_abs,
         "max_pdfs": max_pdf,
-        "min_abstracts_target": min_target,
-        "rules": [
-            "Верни только JSON, без markdown и без поясняющего текста.",
-            "Выбирай ТОЛЬКО paper_id из списка candidates. Никаких paper_id/doi из головы.",
-            "Если select_for_pdf=1, то обязательно select_for_abstract=1.",
-            "Разделяй выбор по tier: core, support, background.",
-            "Отсортируй selected по tier: сначала core, затем support, затем background.",
-            f"Старайся выбрать НЕ МЕНЬШЕ min_abstracts_target={min_target}, если релевантных кандидатов достаточно.",
-            "Если релевантных меньше min_abstracts_target — выбери все релевантные и заполни shortfall_reason.",
-            "Аббревиатуры неоднозначны: интерпретируй их по контексту идеи и domain/field/subfield кандидата; конфликтующий домен исключай.",
-            "Для PDF выбирай до max_pdfs, но с приоритетом высокого шанса OA (репозитории/PMC/Zenodo/arXiv, HIGH/MED hints). Если OA мало — заполни pdf_shortfall_reason.",
-            f"Не превышай max_abstracts={max_abs} и max_pdfs={max_pdf}.",
-        ],
         "strict_response_contract": {
-            "selected": [
-                {
-                    "paper_id": "<id из candidates>",
-                    "select_for_abstract": 1,
-                    "select_for_pdf": 0,
-                    "tier": "core|support|background",
-                    "reason": "коротко"
-                }
-            ],
-            "shortfall_reason": "optional",
-            "pdf_shortfall_reason": "optional",
+            "selected": [{"paper_id": "<id из candidates>", "select_for_abstract": 1, "select_for_pdf": 0, "tier": "core|support|background", "reason": "коротко"}],
             "notes": "optional"
         },
         "candidates": reduced_candidates,
     }
-    return "Универсальный screening статей для идеи. Верни только JSON строго по контракту.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    return "FULL screening C1: верни JSON по контракту с selected[].\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def parse_screening_response(path: Path) -> Dict[str, Any]:
@@ -481,7 +493,59 @@ def parse_screening_response(path: Path) -> Dict[str, Any]:
         return json.loads(m.group(0))
 
 
-def validate_screening_response(data: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> Tuple[List[Dict[str, Any]], List[str]]:
+def _tokenize(text: str) -> List[str]:
+    return re.findall(r"[a-zа-я0-9-]{3,}", normalize_text(text).lower())
+
+
+def apply_light_screening(data: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> Tuple[List[Dict[str, Any]], List[str]]:
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return [], ["Корень ответа должен быть JSON-объектом."]
+    include = [normalize_text(str(x)).lower() for x in (data.get("include_keywords") or []) if normalize_text(str(x))]
+    exclude = [normalize_text(str(x)).lower() for x in (data.get("exclude_keywords") or []) if normalize_text(str(x))]
+    allowed_domains = {normalize_text(str(x)).lower() for x in (data.get("allowed_domains") or []) if normalize_text(str(x))}
+    blocked_domains = {normalize_text(str(x)).lower() for x in (data.get("blocked_domains") or []) if normalize_text(str(x))}
+    if len(include) < 1:
+        errors.append("include_keywords пустой.")
+    target_abs = max(1, min(max_abs, to_int(data.get("target_abstracts", max_abs), max_abs)))
+    target_pdf = max(0, min(max_pdf, to_int(data.get("target_pdfs", max_pdf), max_pdf), target_abs))
+
+    scored: List[Dict[str, Any]] = []
+    for c in candidates:
+        text = " ".join([c.get("title", ""), c.get("abstract_snippet", ""), c.get("venue", ""), c.get("domain", ""), c.get("field", ""), c.get("subfield", "")]).lower()
+        domain = normalize_text(c.get("domain", "")).lower()
+        if allowed_domains and domain and domain not in allowed_domains:
+            continue
+        if domain and domain in blocked_domains:
+            continue
+        score = 0.0
+        for kw in include:
+            if kw and kw in text:
+                score += 2.0
+                score += 0.2 * text.count(kw)
+        excluded = False
+        for kw in exclude:
+            if kw and kw in text:
+                score -= 4.0
+                excluded = True
+        if excluded and score < 0:
+            continue
+        score += 1.5 * c.get("domain_match_score", 0)
+        c2 = dict(c)
+        c2["relevance_score"] = round(score, 4)
+        scored.append(c2)
+    scored.sort(key=lambda x: (-to_float(x.get("relevance_score", 0.0)), -to_float(x.get("score", 0.0)), -to_int(x.get("cited_by", 0)), x.get("paper_id", "")))
+    selected: List[Dict[str, Any]] = []
+    for i, c in enumerate(scored):
+        a = 1 if i < target_abs else 0
+        p = 1 if i < target_pdf else 0
+        if p and c.get("downloadability_hint") not in ("HIGH", "MED"):
+            p = 0
+        selected.append({**c, "select_for_abstract": a, "select_for_pdf": p, "tier": "support", "reason": "light-screening"})
+    return selected, errors
+
+
+def validate_full_screening_response(data: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> Tuple[List[Dict[str, Any]], List[str]]:
     errors: List[str] = []
     if not isinstance(data, dict) or not isinstance(data.get("selected"), list):
         return [], ["Корень ответа должен быть объектом с массивом 'selected'."]
@@ -719,6 +783,88 @@ def response_ready(resp_path: Path) -> bool:
     return raw not in ('', '{}', '{"selected": []}')
 
 
+def wait_for_response(resp_path: Path, logger: RunLogger, timeout_sec: int = 3600) -> bool:
+    start = time.time()
+    last_size = -1
+    logger.info('[4/6] ChatGPT screening: ожидаю RESPONSE.json ...')
+    while True:
+        try:
+            if resp_path.exists():
+                size = resp_path.stat().st_size
+                if size != last_size:
+                    last_size = size
+                    logger.info(f'RESPONSE.json обновлен: size={size} байт')
+                if response_ready(resp_path):
+                    try:
+                        parse_screening_response(resp_path)
+                        return True
+                    except Exception:
+                        pass
+            elapsed = int(time.time() - start)
+            if elapsed >= timeout_sec:
+                logger.warn('Таймаут ожидания ответа ChatGPT.')
+                return False
+            if elapsed % 30 == 0:
+                print(f'... Я жду RESPONSE.json ({elapsed} сек)')
+            time.sleep(2)
+        except KeyboardInterrupt:
+            logger.warn('Ожидание RESPONSE.json прервано пользователем (Ctrl+C).')
+            return False
+
+
+def ask_cleanup_choice(idea_dir: Path) -> str:
+    traces = [
+        idea_dir / 'in' / 'papers',
+        idea_dir / 'in' / 'c1_chatgpt',
+        idea_dir / 'out' / 'harvest_report.md',
+        idea_dir / 'out' / 'prisma_c1.md',
+    ]
+    if not any(p.exists() for p in traces):
+        return 'N'
+    print('Найдены результаты прошлого запуска C1. Удалить? [Y] Да / [N] Нет (resume) / [Q] Отмена')
+    while True:
+        choice = normalize_text(input('Ваш выбор [Y/N/Q]: ')).upper() or 'Y'
+        if choice in ('Y', 'N', 'Q'):
+            return choice
+
+
+def cleanup_previous_run(idea_dir: Path, logger: RunLogger) -> None:
+    papers_dir = idea_dir / 'in' / 'papers'
+    chat_dir = idea_dir / 'in' / 'c1_chatgpt'
+    out_dir = idea_dir / 'out'
+    manual_backup = idea_dir / 'in' / 'pdf_manual_queue.prev.csv'
+    src_manual = papers_dir / 'pdf_manual_queue.csv'
+    if src_manual.exists():
+        shutil.copyfile(src_manual, manual_backup)
+    if papers_dir.exists():
+        shutil.rmtree(papers_dir, ignore_errors=True)
+    if chat_dir.exists():
+        shutil.rmtree(chat_dir, ignore_errors=True)
+    for p in [out_dir / 'harvest_report.md', out_dir / 'prisma_c1.md', out_dir / '_moduleC1_checkpoint.json']:
+        p.unlink(missing_ok=True)
+    logger.info('Очистка результатов прошлого C1 завершена.')
+
+
+def open_final_artifacts(out_dir: Path, manifests_dir: Path, papers_dir: Path) -> None:
+    report = out_dir / 'harvest_report.md'
+    errors = manifests_dir / 'errors.csv'
+    try:
+        if report.exists():
+            subprocess.Popen(['notepad', str(report)])
+    except Exception:
+        pass
+    try:
+        if errors.exists() and errors.stat().st_size > 10:
+            subprocess.Popen(['notepad', str(errors)])
+    except Exception:
+        pass
+    try:
+        if papers_dir.exists():
+            subprocess.Popen(['explorer', str(papers_dir)])
+    except Exception:
+        pass
+
+
 def repair_manual_pdfs_only(papers_dir: Path, pdf_dir: Path, logger: RunLogger) -> int:
     qpath = papers_dir / 'pdf_manual_queue.csv'
     if not qpath.exists():
@@ -747,7 +893,7 @@ def repair_manual_pdfs_only(papers_dir: Path, pdf_dir: Path, logger: RunLogger) 
 def main() -> int:
     ap = argparse.ArgumentParser(description='Stage C1: универсальный ChatGPT-screening + harvest')
     ap.add_argument('--idea-dir', default='')
-    ap.add_argument('--screening', choices=['chatgpt', 'none'], default='chatgpt')
+    ap.add_argument('--screening', choices=['light', 'full', 'none'], default='light')
     ap.add_argument('--max-candidates', type=int, default=400)
     ap.add_argument('--max-abstracts', type=int, default=120)
     ap.add_argument('--max-pdfs', type=int, default=40)
@@ -784,7 +930,14 @@ def main() -> int:
         if args.repair_manual_pdfs:
             return repair_manual_pdfs_only(papers_dir, pdf_dir, logger)
 
-        harvest_mode = response_ready(resp_path)
+        cleanup_choice = ask_cleanup_choice(idea_dir)
+        if cleanup_choice == 'Q':
+            logger.info('Отмена по запросу пользователя.')
+            return 0
+        if cleanup_choice == 'Y':
+            cleanup_previous_run(idea_dir, logger)
+
+        harvest_mode = False
         secrets = load_secrets(root)
         oa = ApiClient('OpenAlex', args.rps_openalex, args.timeout, logger)
         up = ApiClient('Unpaywall', args.rps_unpaywall, args.timeout, logger)
@@ -796,51 +949,34 @@ def main() -> int:
             corpus_path = out_dir / 'corpus.csv'
             if not corpus_path.exists():
                 raise FileNotFoundError(f'Не найден обязательный файл: {corpus_path}')
-            logger.info('[1/6] Читаю corpus.csv')
             rows = load_corpus(corpus_path)
+            logger.info(f'[1/6] Читаю corpus.csv (N={len(rows)})')
             idea_text, structured, keywords = extract_idea_context(idea_dir)
             candidates, rejected, stats = preclean_corpus(rows, oa, secrets, keywords, logger, args.max_candidates)
+            stats['corpus_n'] = len(rows)
             logger.info(f"[2/6] Дедуп/фильтры => осталось {len(candidates)}")
             logger.info('[3/6] Готовлю candidates.json и PROMPT')
             for c in candidates:
-                urls = []
-                if c.get('oa_pdf_url'):
-                    urls.append(c['oa_pdf_url'])
-                if c.get('doi') and secrets.get('UNPAYWALL_EMAIL'):
-                    try:
-                        xs, _ = fetch_unpaywall_pdf_urls(c['doi'], up, secrets['UNPAYWALL_EMAIL'])
-                        urls.extend(xs)
-                    except Exception as exc:
-                        error_rows.append({'paper_id': c['paper_id'], 'step': 'unpaywall_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': c.get('doi', ''), 'openalex_id': c.get('openalex_id', '')})
-                if c.get('pmid'):
-                    try:
-                        xs, _ = fetch_europepmc_pdf_urls(c['pmid'], epmc)
-                        urls.extend(xs)
-                    except Exception as exc:
-                        error_rows.append({'paper_id': c['paper_id'], 'step': 'europepmc_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': c.get('doi', ''), 'openalex_id': c.get('openalex_id', '')})
-                if not urls and (c.get('doi') or c.get('title')):
-                    s2u, _ = fetch_semantic_scholar_pdf_url(c.get('doi', ''), c.get('title', ''), s2, secrets.get('S2_API_KEY', ''))
-                    if s2u:
-                        urls.append(s2u)
-                c['oa_pdf_candidates'] = sort_pdf_candidates(urls)[:3]
+                c['oa_pdf_candidates'] = sort_pdf_candidates([c.get('oa_pdf_url', '')])[:1]
                 c['downloadability_hint'] = choose_hint(c['oa_pdf_candidates'])
             write_json(candidates_path, candidates)
             write_csv(papers_dir / 'preselection_rejected.csv', rejected, ['index', 'title', 'doi', 'openalex_id', 'reason'])
             write_json(checkpoint_path, {'phase': 'PREPARE_DONE', 'stats': stats, 'idea_dir': str(idea_dir), 'ts': ts})
-            if args.screening == 'chatgpt':
+            if args.screening in ('light', 'full'):
                 c1_chat_dir.mkdir(parents=True, exist_ok=True)
-                prompt = generate_screening_prompt(idea_text, structured, candidates, args.max_abstracts, args.max_pdfs)
+                prompt = generate_light_screening_prompt(idea_text, structured, candidates, args.max_abstracts, args.max_pdfs) if args.screening == 'light' else generate_full_screening_prompt(idea_text, structured, candidates, args.max_abstracts, args.max_pdfs)
                 prompt_path.write_text(prompt, encoding='utf-8')
                 if not resp_path.exists():
-                    resp_path.write_text('{\n  "selected": []\n}\n', encoding='utf-8')
-                (c1_chat_dir / 'README_WHAT_TO_DO.txt').write_text('1) Откройте PROMPT.txt и отправьте в ChatGPT.\n2) Вставьте JSON-ответ в RESPONSE.json.\n3) Запустите RUN_C1.bat повторно.\n', encoding='utf-8')
+                    resp_path.write_text('{}\n', encoding='utf-8')
+                (c1_chat_dir / 'README_WHAT_TO_DO.txt').write_text('1) Откройте PROMPT.txt и отправьте в ChatGPT.\n2) Вставьте JSON-ответ в RESPONSE.json и сохраните файл.\n3) Скрипт автоматически продолжит работу.\n', encoding='utf-8')
                 copied = copy_prompt_file_to_clipboard(prompt_path)
                 open_prepare_artifacts(c1_chat_dir, prompt_path, resp_path)
-                logger.info('[4/6] Ожидаю ответ ChatGPT (папка/файлы открыты)')
-                print('\nЖду ответ в RESPONSE.json. Запустите RUN_C1 повторно.\n')
+                logger.info(f'[4/6] ChatGPT screening ({args.screening.upper()}): создан PROMPT, ожидаю RESPONSE...')
+                print('\nШаги: 1) Вставьте PROMPT в ChatGPT  2) Сохраните JSON в RESPONSE.json  3) Скрипт продолжит сам.\n')
                 if copied:
                     print('PROMPT скопирован в буфер обмена.')
-                return 2
+                if not wait_for_response(resp_path, logger, timeout_sec=3600):
+                    return 2
 
         logger.info('[4/6] HARVEST: использую готовые candidates + RESPONSE')
         candidates = load_json_if_exists(candidates_path, [])
@@ -850,14 +986,41 @@ def main() -> int:
         stats = (load_json_if_exists(checkpoint_path, {}).get('stats') or {'corpus_n': 0, 'after_dedup_n': 0, 'after_domain_filter_n': len(candidates)})
         if args.screening == 'none':
             selected = [{**c, 'select_for_abstract': 1 if i < args.max_abstracts else 0, 'select_for_pdf': 1 if i < args.max_pdfs else 0, 'tier': 'support', 'reason': 'автовыбор'} for i, c in enumerate(candidates)]
+        elif args.screening == 'light':
+            raw = parse_screening_response(resp_path)
+            selected, validation_errors = apply_light_screening(raw, candidates, args.max_abstracts, args.max_pdfs)
+            if validation_errors:
+                write_json(c1_chat_dir / 'RESPONSE.INVALID.json', {'errors': validation_errors, 'response': raw})
+                raise RuntimeError('RESPONSE.json (LIGHT) не прошел валидацию; см. RESPONSE.INVALID.json')
         else:
             raw = parse_screening_response(resp_path)
-            selected, validation_errors = validate_screening_response(raw, candidates, args.max_abstracts, args.max_pdfs)
+            selected, validation_errors = validate_full_screening_response(raw, candidates, args.max_abstracts, args.max_pdfs)
             if validation_errors:
                 write_json(c1_chat_dir / 'RESPONSE.INVALID.json', {'errors': validation_errors, 'response': raw})
                 raise RuntimeError('RESPONSE.json не прошел валидацию; см. RESPONSE.INVALID.json')
         selected_abs = [x for x in selected if int(x.get('select_for_abstract', 0)) == 1]
         selected_pdf = [x for x in selected if int(x.get('select_for_pdf', 0)) == 1]
+        logger.info(f'[3/6] Обогащение OA-линками (best-effort) для топ PDF-кандидатов: {min(len(selected_pdf), 80)}')
+        for item in selected_pdf[:80]:
+            urls = list(item.get('oa_pdf_candidates', []))
+            if item.get('doi') and secrets.get('UNPAYWALL_EMAIL'):
+                try:
+                    xs, _ = fetch_unpaywall_pdf_urls(item['doi'], up, secrets['UNPAYWALL_EMAIL'])
+                    urls.extend(xs)
+                except Exception as exc:
+                    error_rows.append({'paper_id': item['paper_id'], 'step': 'unpaywall_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+            if item.get('pmid'):
+                try:
+                    xs, _ = fetch_europepmc_pdf_urls(item['pmid'], epmc)
+                    urls.extend(xs)
+                except Exception as exc:
+                    error_rows.append({'paper_id': item['paper_id'], 'step': 'europepmc_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+            if not urls and (item.get('doi') or item.get('title')):
+                s2u, _ = fetch_semantic_scholar_pdf_url(item.get('doi', ''), item.get('title', ''), s2, secrets.get('S2_API_KEY', ''))
+                if s2u:
+                    urls.append(s2u)
+            item['oa_pdf_candidates'] = sort_pdf_candidates(urls)[:5]
+            item['downloadability_hint'] = choose_hint(item['oa_pdf_candidates'])
         write_csv(papers_dir / 'selection.csv', selected, ['paper_id', 'title', 'year', 'doi', 'openalex_id', 'first_author', 'tier', 'downloadability_hint', 'select_for_abstract', 'select_for_pdf', 'reason', 'domain', 'field', 'subfield'])
         write_jsonl(papers_dir / 'papers.jsonl', selected)
 
@@ -986,6 +1149,7 @@ def main() -> int:
         summary_text = "\n".join(summary_lines)
         logger.info(summary_text.replace("\n", " | "))
         print(summary_text)
+        open_final_artifacts(out_dir, manifests_dir, papers_dir)
         return 0
 
     except Exception as exc:
