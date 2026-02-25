@@ -1,0 +1,12 @@
+[ERROR] JSONDecodeError('Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)')
+Traceback (most recent call last):
+  File "D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\tools\c_evidence_engine.py", line 378, in main
+    st = load_structured_idea(structured_path)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\tools\c_evidence_engine.py", line 123, in load_structured_idea
+    obj = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\artae\AppData\Local\Programs\Python\Python311\Lib\json\__init__.py", line 335, in loads
+    raise JSONDecodeError("Unexpected UTF-8 BOM (decode using utf-8-sig)",
+json.decoder.JSONDecodeError: Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)
+

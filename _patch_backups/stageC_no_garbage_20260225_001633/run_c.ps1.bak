@@ -1,0 +1,197 @@
+﻿param([string]$IdeaDir = "")
+
+# UTF-8 for Windows PowerShell 5.1 console I/O
+[Console]::InputEncoding  = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Console]::OutputEncoding
+$ErrorActionPreference = "Stop"
+
+function Say([string]$s){ Write-Host $s }
+function LogLine([string]$logPath, [string]$s){
+  $s | Out-File -FilePath $logPath -Append -Encoding UTF8
+}
+
+$Root = Split-Path -Parent $PSScriptRoot
+Set-Location $Root
+
+# logs (one file, minimal clutter)
+$LogDir = Join-Path $Root "launcher_logs"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$Log = Join-Path $LogDir "runC_last.log"
+"" | Out-File -FilePath $Log -Encoding UTF8
+$Log | Out-File -FilePath (Join-Path $LogDir "LAST_LOG.txt") -Encoding UTF8
+
+function Resolve-IdeaDir([string]$arg) {
+  $ideas = Join-Path $Root "ideas"
+  if (-not (Test-Path $ideas)) { throw "Нет папки ideas. Сначала запусти 1_NEW_IDEA.bat" }
+
+  # 1) active idea
+  if ([string]::IsNullOrWhiteSpace($arg)) {
+    $active = Join-Path $ideas "_ACTIVE_PATH.txt"
+    if (Test-Path $active) {
+      $p = (Get-Content -LiteralPath $active -Raw).Trim()
+      if ($p) {
+        if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Root $p }
+        $p = [IO.Path]::GetFullPath($p)
+        if (Test-Path $p) { return $p }
+      }
+    }
+  }
+
+  # 2) explicit arg
+  if ($arg -and $arg.Trim()) {
+    $p = $arg
+    if (-not [IO.Path]::IsPathRooted($p)) { $p = Join-Path $Root $p }
+    $p = [IO.Path]::GetFullPath($p)
+    if ((Split-Path -Leaf $p) -ieq "out") { $p = Split-Path -Parent $p }
+    if (-not (Test-Path $p)) { throw "Папка идеи не найдена: $p" }
+    return $p
+  }
+
+  # 3) newest by name
+  $cands = Get-ChildItem -LiteralPath $ideas -Directory -ErrorAction SilentlyContinue |
+           Where-Object { $_.Name -like "IDEA-*" } |
+           Sort-Object Name -Descending
+  $first = $cands | Select-Object -First 1
+  if ($first) { return $first.FullName }
+
+  throw "В папке ideas нет ни одной IDEA-*"
+}
+
+function Ensure-IdeaLayout([string]$ideaDir){
+  $inDir   = Join-Path $ideaDir "in"
+  $outDir  = Join-Path $ideaDir "out"
+  $logsDir = Join-Path $ideaDir "logs"
+  New-Item -ItemType Directory -Force -Path $inDir,$outDir,$logsDir | Out-Null
+}
+
+function Extract-JsonObject([string]$text){
+  # best effort: take from first '{' to last '}'
+  $s = $text
+  $i0 = $s.IndexOf("{")
+  $i1 = $s.LastIndexOf("}")
+  if ($i0 -lt 0 -or $i1 -le $i0) { return $null }
+  return $s.Substring($i0, ($i1-$i0+1))
+}
+
+function Restore-StructuredIdeaIfMissing([string]$ideaDir, [string]$logPath){
+  $inDir  = Join-Path $ideaDir "in"
+  $outDir = Join-Path $ideaDir "out"
+  $dst    = Join-Path $outDir "structured_idea.json"
+  if (Test-Path $dst) { return $true }
+
+  # IMPORTANT: Stage B часто очищает out/ и стирает structured_idea.json.
+  # Восстанавливаем из in\llm_response.json (Stage A ChatGPT JSON).
+  $src = Join-Path $inDir "llm_response.json"
+  if (-not (Test-Path $src)) { return $false }
+
+  try {
+    $raw = Get-Content -LiteralPath $src -Raw
+    $json = Extract-JsonObject $raw
+    if (-not $json) { return $false }
+
+    # validate minimal structure
+    $obj = $json | ConvertFrom-Json -ErrorAction Stop
+    if ($null -eq $obj.structured_idea) { return $false }
+
+    # write pretty JSON (stable, valid)
+    [System.IO.File]::WriteAllText($dst, $json, (New-Object System.Text.UTF8Encoding($false)))
+    LogLine $logPath "[INFO] Восстановил out\structured_idea.json из in\llm_response.json (Stage B мог очистить out)."
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+try {
+  $IdeaDir = Resolve-IdeaDir $IdeaDir
+  $IdeaDir = (Resolve-Path $IdeaDir).Path
+  $ideaName = Split-Path $IdeaDir -Leaf
+
+  Ensure-IdeaLayout $IdeaDir
+  $inDir   = Join-Path $IdeaDir "in"
+  $outDir  = Join-Path $IdeaDir "out"
+
+  Say "Stage C: таблица доказательств (Evidence Table) — идея: $ideaName"
+  LogLine $Log "[INFO] IDEA=$IdeaDir"
+
+  # prerequisites
+  $corpus = Join-Path $outDir "corpus.csv"
+  if (-not (Test-Path $corpus)) {
+    Say ""
+    Say "❌ Не найден out\corpus.csv."
+    Say "Сначала запусти RUN_B.bat (он делает corpus.csv)."
+    exit 1
+  }
+
+  # restore structured_idea if Stage B wiped it
+  if (-not (Restore-StructuredIdeaIfMissing $IdeaDir $Log)) {
+    Say ""
+    Say "❌ Не найден out\structured_idea.json и не получилось восстановить из in\llm_response.json."
+    Say "Сначала запусти RUN_A.bat (и сохрани JSON в in\llm_response.json), затем RUN_B.bat, потом снова RUN_C.bat."
+    exit 1
+  }
+
+  # resolve python
+  $py = Join-Path $Root ".venv\Scripts\python.exe"
+  if (-not (Test-Path $py)) { throw "Не найден .venv. Запусти 0_SETUP.bat" }
+
+  $script = Join-Path $Root "tools\c_evidence_engine.py"
+  if (-not (Test-Path $script)) { throw "Не найден tools\c_evidence_engine.py" }
+
+  # run
+  $env:PYTHONUTF8 = "1"
+  $env:PYTHONIOENCODING = "utf-8"
+
+  LogLine $Log "[CMD] $py $script --idea "$IdeaDir""
+  & $py $script --idea $IdeaDir 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
+  $rc = $LASTEXITCODE
+
+  if ($rc -eq 0) {
+    Say ""
+    Say "✅ Stage C готова."
+    Say "Файлы результата:"
+    Say "  - out\evidence_table.csv"
+    Say "  - out\evidence_summary.md"
+    Say "Дальше: запусти RUN_D.bat"
+    $sum = Join-Path $outDir "evidence_summary.md"
+    if (Test-Path $sum) { Start-Process notepad.exe -ArgumentList $sum | Out-Null }
+    Start-Process explorer.exe -ArgumentList $IdeaDir | Out-Null
+    exit 0
+  }
+
+  if ($rc -eq 2) {
+    $prompt = Join-Path $outDir "llm_prompt_C.txt"
+    $resp   = Join-Path $inDir  "llm_evidence.json"
+    if (-not (Test-Path $resp)) { New-Item -ItemType File -Force -Path $resp | Out-Null }
+
+    Say ""
+    Say "Нужен ChatGPT (1 раз). Делай так:"
+    Say "1) PROMPT уже скопирован в буфер (Ctrl+V в ChatGPT)."
+    Say "2) В ChatGPT вставь PROMPT и отправь."
+    Say "3) Из ответа скопируй ТОЛЬКО JSON (без текста)."
+    Say "4) Вставь JSON в файл: in\llm_evidence.json, сохрани."
+    Say "5) Запусти RUN_C.bat ещё раз."
+
+    if (Test-Path $prompt) {
+      Set-Clipboard -Value (Get-Content -Raw -LiteralPath $prompt)
+      Start-Process notepad.exe -ArgumentList $prompt | Out-Null
+    }
+    Start-Process notepad.exe -ArgumentList $resp | Out-Null
+    Start-Process explorer.exe -ArgumentList $IdeaDir | Out-Null
+    exit 2
+  }
+
+  Say ""
+  Say "❌ Stage C: ошибка (ExitCode=$rc). Открою лог."
+  Start-Process notepad.exe -ArgumentList $Log | Out-Null
+  exit 1
+}
+catch {
+  Say ""
+  Say "❌ Stage C: ошибка запуска. Открою лог."
+  $_ | Out-String | Out-File -FilePath $Log -Append -Encoding UTF8
+  Start-Process notepad.exe -ArgumentList $Log | Out-Null
+  exit 1
+}
+

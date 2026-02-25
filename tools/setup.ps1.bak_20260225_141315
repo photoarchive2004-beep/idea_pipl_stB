@@ -62,13 +62,11 @@ function GetBasePython() {
   }
 
   $ver = "3.11.9"
-    $pkgName = "python"
-  if (-not [Environment]::Is64BitOperatingSystem) { $pkgName = "pythonx86" }
-  $pkgUrl = ("https://www.nuget.org/api/v2/package/{0}/$ver" -f $pkgName)
+  $pkgUrl = "https://www.nuget.org/api/v2/package/python/$ver"
   $pkgDir = Join-Path $Root ".cache"
   New-Item -ItemType Directory -Force -Path $pkgDir | Out-Null
 
-  $pkgFile = Join-Path $pkgDir (($pkgName + ".") + $ver + ".nupkg")
+  $pkgFile = Join-Path $pkgDir ("python." + $ver + ".nupkg")
   if (-not (Test-Path $pkgFile)) {
     LogLine ("[INFO] Downloading portable Python from NuGet: " + $ver)
     DownloadFile -Url $pkgUrl -OutFile $pkgFile -Retries 3
@@ -159,4 +157,3 @@ try {
   LogLine ("[ERROR] " + $err)
   exit 1
 }
-

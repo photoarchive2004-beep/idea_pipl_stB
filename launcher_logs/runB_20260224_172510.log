@@ -1,0 +1,24 @@
+﻿
+[INFO] ROOT=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT
+[INFO] IDEA_DIR=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001
+[INFO] SCOPE=balanced
+[INFO] N=300
+[INFO] LOG=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\launcher_logs\runB_20260224_172510.log
+[INFO] PY=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\.venv\Scripts\python.exe
+[INFO] CMD: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\.venv\Scripts\python.exe D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\tools\b_lit_scout.py --idea-dir D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001 --n 300 --scope balanced
+===== Ð¡Ð²Ð¾Ð´ÐºÐ° Stage B (Ð¸Ð· Python) =====
+=== Ð¡Ð²Ð¾Ð´ÐºÐ° Stage B ===
+Ð¡Ñ‚Ð°Ñ‚ÑƒÑ: OK
+Ð’Ñ€ÐµÐ¼Ñ (UTC): ÑÑ‚Ð°Ñ€Ñ‚ 2026-02-24T14:25:10Z
+Ð”Ð¾Ð±Ð°Ð²Ð»ÐµÐ½Ð¾ OpenAlex: 16819
+Ð”Ð¾Ð±Ð°Ð²Ð»ÐµÐ½Ð¾ NCBI: 817
+Ð”ÐµÐ´ÑƒÐ¿ (ÑƒÐ½Ð¸ÐºÐ°Ð»ÑŒÐ½Ñ‹Ñ… ÐºÐ»ÑŽÑ‡ÐµÐ¹): 17636
+Ð˜Ñ‚Ð¾Ð³ corpus.csv: 300 Ð·Ð°Ð¿Ð¸ÑÐµÐ¹
+Ð˜Ñ‚Ð¾Ð³ corpus_all.csv: 1802 Ð·Ð°Ð¿Ð¸ÑÐµÐ¹
+Ð—Ð°Ð¿Ñ€Ð¾ÑÐ¾Ð² OpenAlex: 115
+Ð—Ð°Ð¿Ñ€Ð¾ÑÐ¾Ð² NCBI: 32
+Ð¤Ð°Ð¹Ð» ÐºÐ¾Ñ€Ð¿ÑƒÑÐ°: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001\out\corpus.csv
+Ð¤Ð°Ð¹Ð» Ð¿Ð¾Ð»Ð½Ð¾Ð³Ð¾ ÐºÐ¾Ñ€Ð¿ÑƒÑÐ°: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001\out\corpus_all.csv
+Ð›Ð¾Ð³ Ð¿Ð¾Ð¸ÑÐºÐ°: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001\out\search_log.json
+Ð›Ð¾Ð³ Ð¼Ð¾Ð´ÑƒÐ»Ñ: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001\out\module_B.log
+Ð§ÐµÐºÐ¿Ð¾Ð¸Ð½Ñ‚: D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001\out\_moduleB_checkpoint.json

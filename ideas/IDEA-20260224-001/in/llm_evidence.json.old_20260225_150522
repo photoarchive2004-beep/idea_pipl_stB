@@ -1,0 +1,225 @@
+{
+"meta": { "language": "ru" },
+"evidence_rows": [
+{
+"claim_id": 1,
+"source_id": "S1",
+"relation": "unclear",
+"quote": "The Nei genetic distance between the populations studied was 0.018–0.215",
+"quote_location": "abstract",
+"certainty": "Low",
+"certainty_reason": "methods_mismatch"
+},
+{
+"claim_id": 1,
+"source_id": "S2",
+"relation": "unclear",
+"quote": "There is evidence for a burst of hybridization and widespread introgression from local H. zea into invasive H. armigera",
+"quote_location": "abstract",
+"certainty": "Low",
+"certainty_reason": "methods_mismatch"
+},
+{
+"claim_id": 1,
+"source_id": "S3",
+"relation": "unclear",
+"quote": "a positive relationship between allelic differentiation and resistance to introgression across the genome",
+"quote_location": "abstract",
+"certainty": "Low",
+"certainty_reason": "methods_mismatch"
+},
+{
+"claim_id": 1,
+"source_id": "S4",
+"relation": "unclear",
+"quote": "генетическая дистанция между деревьями разной селекционной категории варьирует от 0,038 до 0,082",
+"quote_location": "abstract",
+"certainty": "Low",
+"certainty_reason": "methods_mismatch"
+},
+{
+"claim_id": 1,
+"source_id": "S5",
+"relation": "unclear",
+"quote": "Three main mitochondrial lineages were identified, distributed in northern, central and southern Italy",
+"quote_location": "abstract",
+"certainty": "Low",
+"certainty_reason": "methods_mismatch"
+},
+{
+"claim_id": 1,
+"source_id": "S6",
+"relation": "unclear",
+"quote": "northward expansion from South Florida followed by genetic isolation and subsequent gene flow among adjacent genetic clusters",
+"quote_location": "abstract",
+"certainty": "Low",
+"certainty_reason": "methods_mismatch"
+},
+
+{
+  "claim_id": 2,
+  "source_id": "S1",
+  "relation": "unclear",
+  "quote": "The Nei genetic distance between the populations studied was 0.018–0.215",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "indirectness"
+},
+{
+  "claim_id": 2,
+  "source_id": "S2",
+  "relation": "unclear",
+  "quote": "генетическая дистанция между деревьями разной селекционной категории варьирует от 0,038 до 0,082",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "indirectness"
+},
+{
+  "claim_id": 2,
+  "source_id": "S3",
+  "relation": "unclear",
+  "quote": "Three main mitochondrial lineages were identified, distributed in northern, central and southern Italy",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "indirectness"
+},
+{
+  "claim_id": 2,
+  "source_id": "S4",
+  "relation": "unclear",
+  "quote": "northward expansion from South Florida followed by genetic isolation and subsequent gene flow among adjacent genetic clusters",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "indirectness"
+},
+{
+  "claim_id": 2,
+  "source_id": "S5",
+  "relation": "unclear",
+  "quote": "recent changes in oceanographic circulation of the eastern Atlantic Ocean that may have acted as barrier to gene flow",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "indirectness"
+},
+{
+  "claim_id": 2,
+  "source_id": "S6",
+  "relation": "unclear",
+  "quote": "The Ensatina eschscholtzii complex of plethodontid salamanders, a well-known \"ring species,\" is thought to illustrate stages in the speciation process",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "indirectness"
+},
+
+{
+  "claim_id": 3,
+  "source_id": "S1",
+  "relation": "unclear",
+  "quote": "Three main mitochondrial lineages were identified, distributed in northern, central and southern Italy",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 3,
+  "source_id": "S2",
+  "relation": "unclear",
+  "quote": "We quantified how demography, recombination, and selection have led to the current genetic diversity of the green anole",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 3,
+  "source_id": "S3",
+  "relation": "unclear",
+  "quote": "We explore the genetic structure of the widespread starfish, Marthasterias spp.",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 3,
+  "source_id": "S4",
+  "relation": "unclear",
+  "quote": "has undergone instances of range contraction, isolation, differentiation, and then expansion and secondary contact",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 3,
+  "source_id": "S5",
+  "relation": "unclear",
+  "quote": "range expansions along river valleys in independent corridors to the north led eventually to a secondary contact zone",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 3,
+  "source_id": "S6",
+  "relation": "unclear",
+  "quote": "range expansions along river valleys in independent corridors to the north led eventually to a secondary contact zone",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+
+{
+  "claim_id": 4,
+  "source_id": "S1",
+  "relation": "unclear",
+  "quote": "The historical demographic reconstructions suggest that in both northern and central Italy, an expansion occurred",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 4,
+  "source_id": "S2",
+  "relation": "unclear",
+  "quote": "We quantified how demography, recombination, and selection have led to the current genetic diversity of the green anole",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 4,
+  "source_id": "S3",
+  "relation": "unclear",
+  "quote": "recent changes in oceanographic circulation of the eastern Atlantic Ocean that may have acted as barrier to gene flow",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 4,
+  "source_id": "S4",
+  "relation": "unclear",
+  "quote": "Current research targets regions once thought to show primary intergradation, but which molecular markers reveal to be zones of secondary contact",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 4,
+  "source_id": "S5",
+  "relation": "unclear",
+  "quote": "Phylogeographic, nested clade, and coalescence analyses were used to elucidate the species evolutionary history",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+},
+{
+  "claim_id": 4,
+  "source_id": "S6",
+  "relation": "unclear",
+  "quote": "Phylogeographic, nested clade, and coalescence analyses were used to elucidate the species evolutionary history",
+  "quote_location": "abstract",
+  "certainty": "Low",
+  "certainty_reason": "methods_mismatch"
+}
+
+]
+}

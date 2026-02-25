@@ -1,0 +1,5 @@
+﻿
+[INFO] IDEA=D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001
+[INFO] MODE=deep
+[INFO] noLLM=False
+[CMD] D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\.venv\Scripts\python.exe D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\tools\c_evidence_engine.py --idea D:\YandexDisk\Research_tools\Idea-pipeline\IDEA_PIPELINE_DIST_1.2_GIT\ideas\IDEA-20260224-001 --mode deep

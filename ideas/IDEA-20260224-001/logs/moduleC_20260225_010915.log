@@ -1,0 +1,4 @@
+[QC] papers_total=300 kept_after_guard=182 no_abstract_pct=0.157
+[QC] idea_domain=eco_evo (conf=1.0) corpus_domain=eco_evo (conf=0.554) target_domain=eco_evo
+[NEED] LLM evidence JSON missing/invalid: Placeholder JSON (paste ChatGPT output).
+[NEED] Prompt generated: out/llm_prompt_C.txt

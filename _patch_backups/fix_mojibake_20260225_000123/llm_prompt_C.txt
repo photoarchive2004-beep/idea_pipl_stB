@@ -1,0 +1,137 @@
+﻿# MODULE C: Evidence Table Engine
+
+Ты — строгий научный «экстрактор доказательств».
+Тебе дан список CLAIMS и для каждого — несколько КАНДИДАТНЫХ ИСТОЧНИКОВ (title+abstract).
+
+Твоя задача:
+1) Для каждой пары (claim, source) определить отношение:
+   - supports (поддерживает)
+   - contradicts (противоречит)
+   - unclear (неясно / косвенно / абстракта недостаточно)
+2) Дать короткий фрагмент (quote) ИСКЛЮЧИТЕЛЬНО из предоставленного abstract/snippet.
+3) Оценить уверенность: High / Med / Low.
+4) Коротко указать причину уверенности (certainty_reason): например indirectness / inconsistency / limited detail / review-only / correlational / small sample / methods mismatch.
+
+ЖЁСТКИЕ ПРАВИЛА:
+- НЕ добавляй новые статьи/источники. Используй только те источники, которые есть в входном JSON.
+- НЕ придумывай DOI/год/название — они уже есть.
+- Если абстракта недостаточно, ставь relation=unclear и certainty=Low.
+- Ответ строго в JSON. Никакого текста до/после.
+
+Формат ответа JSON:
+{
+  "meta": {
+    "language": "ru",
+    "notes": "short"
+  },
+  "evidence_rows": [
+    {
+      "claim_id": 1,
+      "source_id": "S1",
+      "relation": "supports",
+      "quote": "...",
+      "quote_location": "abstract",
+      "certainty": "Med",
+      "certainty_reason": "..."
+    }
+  ]
+}
+
+Входные данные (candidates JSON):
+{
+  "claims": [
+    {
+      "claim_id": 1,
+      "claim": "Ð•ÑÐ»Ð¸ Ð²ÐµÑ€Ð½Ð° H1: Ð¿ÐµÑ€ÐµÐ½Ð¾ÑÐ¸Ð¼Ð¾ÑÑ‚ÑŒ (out-of-sample) ÑÐ¸ÑÑ‚ÐµÐ¼Ð°Ñ‚Ð¸Ñ‡ÐµÑÐºÐ¸ Ð²Ñ‹ÑˆÐµ Ð¼ÐµÐ¶Ð´Ñƒ Ð¿Ð°Ñ€Ð°Ð¼Ð¸ Ð¿Ð¾Ð´ÑÐµÑ‚ÐµÐ¹/Ñ€ÐµÐ³Ð¸Ð¾Ð½Ð¾Ð² Ñ ÑÐ¾Ð¿Ð¾ÑÑ‚Ð°Ð²Ð¸Ð¼Ð¾Ð¹ ÑÑ„Ñ„ÐµÐºÑ‚Ð¸Ð²Ð½Ð¾Ð¹ ÑÐ²ÑÐ·Ð½Ð¾ÑÑ‚ÑŒÑŽ (Ð¿Ð¾ river-distance/IBR/resistance) Ð´Ð°Ð¶Ðµ Ð¿Ñ€Ð¸ Ð¾Ð´Ð¸Ð½Ð°ÐºÐ¾Ð²Ð¾Ð¹ (Ð¸Ð»Ð¸ Ð±Ð¾Ð»ÑŒÑˆÐµÐ¹) Ð³ÐµÐ½ÐµÑ‚Ð¸Ñ‡ÐµÑÐºÐ¾Ð¹ Ð´Ð¸ÑÑ‚Ð°Ð½Ñ†Ð¸Ð¸; ÑƒÑ‡ÐµÑ‚ riverscape-resistance Ð·Ð°Ð¼ÐµÑ‚Ð½Ð¾ Ð¿Ð¾Ð²Ñ‹ÑˆÐ°ÐµÑ‚ Ð¾Ð±ÑŠÑÑÐ½ÐµÐ½Ð½ÑƒÑŽ Ð´Ð¸ÑÐ¿ÐµÑ€ÑÐ¸ÑŽ Ð¿ÐµÑ€ÐµÐ½Ð¾ÑÐ¸Ð¼Ð¾ÑÑ‚Ð¸.",
+      "sources": [
+        {
+          "source_id": "S1",
+          "score": 7.4043,
+          "openalex_id": "",
+          "doi": "10.1186/s13073-022-01020-2",
+          "title": "Exploiting genomics to mitigate the public health impact of antimicrobial resistance.",
+          "year": "2022",
+          "venue": "Genome medicine",
+          "cited_by": 0,
+          "abstract": "",
+          "auto_snippet": ""
+        },
+        {
+          "source_id": "S2",
+          "score": 7.4043,
+          "openalex_id": "",
+          "doi": "10.1016/j.ctrv.2022.102418",
+          "title": "Resistance mechanisms to HER2-targeted therapy in gastroesophageal adenocarcinoma: A systematic review.",
+          "year": "2022",
+          "venue": "Cancer treatment reviews",
+          "cited_by": 0,
+          "abstract": "",
+          "auto_snippet": ""
+        },
+        {
+          "source_id": "S3",
+          "score": 6.7101,
+          "openalex_id": "W3093234803",
+          "doi": "10.3390/microorganisms8101587",
+          "title": "Gut Microbiota and Immune System Interactions",
+          "year": "2020",
+          "venue": "Microorganisms",
+          "cited_by": 911,
+          "abstract": "Dynamic interactions between gut microbiota and a host's innate and adaptive immune systems play key roles in maintaining intestinal homeostasis and inhibiting inflammation. The gut microbiota metabolizes proteins and complex carbohydrates, synthesize vitamins, and produce an enormous number of metabolic products that can mediate cross-talk between gut epithelial and immune cells. As a defense mechanism, gut epithelial cells produce a mucosal barrier to segregate microbiota from host immune cells and reduce intestinal permeability. An impaired interaction between gut microbiota and the mucosal immune system can lead to an increased abundance of potentially pathogenic gram-negative bacteria and their associated metabolic changes, disrupting the epithelial barrier and increasing susceptibility to infections. Gut dysbiosis, or negative alterations in gut microbial composition, can also dysregulate immune responses, causing inflammation, oxidative stress, and insulin resistance. Over time, chronic dysbiosis and the translocation of bacteria and their metabolic products across the mucosal barrier may increase prevalence of type 2 diabetes, cardiovascular disease, inflammatory bowel dise…",
+          "auto_snippet": "…erations in gut microbial composition, can also dysregulate immune responses, causing inflammation, oxidative stress, and insulin resistance. Over time, chronic dysbiosis and the translocation of bacteria and their metabolic products across the mucosal barrier…"
+        },
+        {
+          "source_id": "S4",
+          "score": 6.7101,
+          "openalex_id": "W1967821667",
+          "doi": "10.1371/journal.pbio.0060280",
+          "title": "The Pervasive Effects of an Antibiotic on the Human Gut Microbiota, as Revealed by Deep 16S rRNA Sequencing",
+          "year": "2008",
+          "venue": "PLoS Biology",
+          "cited_by": 2318,
+          "abstract": "The human intestinal microbiota is essential to the health of the host and plays a role in nutrition, development, metabolism, pathogen resistance, and regulation of immune responses. Antibiotics may disrupt these coevolved interactions, leading to acute or chronic disease in some individuals. Our understanding of antibiotic-associated disturbance of the microbiota has been limited by the poor sensitivity, inadequate resolution, and significant cost of current research methods. The use of pyrosequencing technology to generate large numbers of 16S rDNA sequence tags circumvents these limitations and has been shown to reveal previously unexplored aspects of the \"rare biosphere.\" We investigated the distal gut bacterial communities of three healthy humans before and after treatment with ciprofloxacin, obtaining more than 7,000 full-length rRNA sequences and over 900,000 pyrosequencing reads from two hypervariable regions of the rRNA gene. A companion paper in PLoS Genetics (see Huse et al., doi: 10.1371/journal.pgen.1000255) shows that the taxonomic information obtained with these methods is concordant. Pyrosequencing of the V6 and V3 variable regions identified 3,300-5,700 taxa that …",
+          "auto_snippet": "…man intestinal microbiota is essential to the health of the host and plays a role in nutrition, development, metabolism, pathogen resistance, and regulation of immune responses. Antibiotics may disrupt these coevolved interactions, leading to acute or chronic …"
+        },
+        {
+          "source_id": "S5",
+          "score": 6.5453,
+          "openalex_id": "W3018052087",
+          "doi": "10.1093/molbev/msaa108",
+          "title": "Adaptive Introgression across Semipermeable Species Boundaries between Local Helicoverpa zea and Invasive Helicoverpa armigera Moths",
+          "year": "2020",
+          "venue": "Molecular Biology and Evolution",
+          "cited_by": 117,
+          "abstract": "Hybridization between invasive and native species has raised global concern, given the dramatic increase in species range shifts and pest outbreaks due to anthropogenic dispersal. Nevertheless, secondary contact between sister lineages of local and invasive species provides a natural laboratory to understand the factors that determine introgression and the maintenance or loss of species barriers. Here, we characterize the early evolutionary outcomes following secondary contact between invasive Helicoverpa armigera and native H. zea in Brazil. We carried out whole-genome resequencing of Helicoverpa moths from Brazil in two temporal samples: during the outbreak of H. armigera in 2013 and 2017. There is evidence for a burst of hybridization and widespread introgression from local H. zea into invasive H. armigera coinciding with H. armigera expansion in 2013. However, in H. armigera, the admixture proportion and the length of introgressed blocks were significantly reduced between 2013 and 2017, suggesting selection against admixture. In contrast to the genome-wide pattern, there was striking evidence for adaptive introgression of a single region from the invasive H. armigera into local…",
+          "auto_snippet": "… evidence for adaptive introgression of a single region from the invasive H. armigera into local H. zea, including an insecticide resistance allele that increased in frequency over time. In summary, despite extensive gene flow after secondary contact, the spec…"
+        },
+        {
+          "source_id": "S6",
+          "score": 6.1104,
+          "openalex_id": "W2606766509",
+          "doi": "10.1002/ece3.2996",
+          "title": "Insight into the roles of selection in speciation from genomic patterns of divergence and introgression in secondary contact in venomous rattlesnakes",
+          "year": "2017",
+          "venue": "Ecology and Evolution",
+          "cited_by": 39,
+          "abstract": "Investigating secondary contact of historically isolated lineages can provide insight into how selection and drift influence genomic divergence and admixture. Here, we studied the genomic landscape of divergence and introgression following secondary contact between lineages of the Western Diamondback Rattlesnake (<i>Crotalus atrox</i>) to determine whether genomic regions under selection in allopatry also contribute to reproductive isolation during introgression. We used thousands of nuclear loci to study genomic differentiation between two lineages that have experienced recent secondary contact following isolation, and incorporated sampling from a zone of secondary contact to identify loci that are resistant to gene flow in hybrids. Comparisons of patterns of divergence and introgression revealed a positive relationship between allelic differentiation and resistance to introgression across the genome, and greater-than-expected overlap between genes linked to lineage-specific divergence and loci that resist introgression. Genes linked to putatively selected markers were related to prominent aspects of rattlesnake biology that differ between populations of Western Diamondback rattle…",
+          "auto_snippet": "…ids. Comparisons of patterns of divergence and introgression revealed a positive relationship between allelic differentiation and resistance to introgression across the genome, and greater-than-expected overlap between genes linked to lineage-specific divergen…"
+        }
+      ]
+    },
+    {
+      "claim_id": 2,
+      "claim": "Ð•ÑÐ»Ð¸ Ð²ÐµÑ€Ð½Ð° H2: Ð¿ÐµÑ€ÐµÐ½Ð¾ÑÐ¸Ð¼Ð¾ÑÑ‚ÑŒ Ð¼Ð¾Ð½Ð¾Ñ‚Ð¾Ð½Ð½Ð¾ ÑƒÐ±Ñ‹Ð²Ð°ÐµÑ‚ Ñ Ð³ÐµÐ½ÐµÑ‚Ð¸Ñ‡ÐµÑÐºÐ¾Ð¹ Ð´Ð¸ÑÑ‚Ð°Ð½Ñ†Ð¸ÐµÐ¹/Ñ€Ð°Ð·Ð»Ð¸Ñ‡Ð¸ÐµÐ¼ Ñ„Ð¾Ð½Ð°; Ð¼ÐµÑ‚Ñ€Ð¸ÐºÐ¸ ÑÐ²ÑÐ·Ð½Ð¾ÑÑ‚Ð¸ Ð´Ð¾Ð±Ð°Ð²Ð»ÑÑŽÑ‚ Ð¼Ð°Ð»Ð¾ Ð¿Ð¾ÑÐ»Ðµ ÑƒÑ‡ÐµÑ‚Ð° Ð´Ð¸ÑÑ‚Ð°Ð½Ñ†Ð¸Ð¸/Ñ„Ð¸Ð»Ð¾Ð³ÐµÐ½Ð¸Ð¸.",
+      "sources": []
+    },
+    {
+      "claim_id": 3,
+      "claim": "Ð•ÑÐ»Ð¸ Ð²ÐµÑ€Ð½Ð° H3: Ð¿ÐµÑ€ÐµÐ½Ð¾ÑÐ¸Ð¼Ð¾ÑÑ‚ÑŒ ÑÑ‚Ð°Ð±Ð¸Ð»ÑŒÐ½Ð¾ Ð²Ñ‹ÑˆÐµ ÑÐ»ÑƒÑ‡Ð°Ð¹Ð½Ð¾Ð³Ð¾ Ð² Ð±Ð¾Ð»ÑŒÑˆÐ¸Ð½ÑÑ‚Ð²Ðµ Ð¿Ð°Ñ€ Ð±Ð°ÑÑÐµÐ¹Ð½Ð¾Ð² Ð¿Ñ€Ð¸ ÑÑ…Ð¾Ð´Ð½Ñ‹Ñ… ÑÐµÐ»ÐµÐºÑ‚Ð¸Ð²Ð½Ñ‹Ñ… Ð¾ÑÑÑ… Ð¸ Ð¾ÑÑ‚Ð°ÐµÑ‚ÑÑ Ð¿Ð¾ÑÐ»Ðµ ÐºÐ¾Ð½Ñ‚Ñ€Ð¾Ð»ÐµÐ¹; Ð¿ÐµÑ€ÐµÐºÑ€Ñ‹Ñ‚Ð¸Ðµ ÐºÐ°Ð½Ð´Ð¸Ð´Ð°Ñ‚Ð¾Ð²/Ð¿ÑƒÑ‚ÐµÐ¹ Ð²Ñ‹ÑˆÐµ Ð½ÑƒÐ»Ñ Ð¸ Ð¿Ð¾Ð²Ñ‚Ð¾Ñ€ÑÐµÑ‚ÑÑ.",
+      "sources": []
+    },
+    {
+      "claim_id": 4,
+      "claim": "Ð•ÑÐ»Ð¸ Ð²ÐµÑ€Ð½Ð° H4: Ð¿Ñ€Ð¸ Ð´Ð¾Ð±Ð°Ð²Ð»ÐµÐ½Ð¸Ð¸ Ð»Ð°Ñ‚ÐµÐ½Ñ‚Ð½Ñ‹Ñ… Ñ„Ð°ÐºÑ‚Ð¾Ñ€Ð¾Ð²/Ð¿Ñ€Ð¾ÑÑ‚Ñ€Ð°Ð½ÑÑ‚Ð²ÐµÐ½Ð½Ñ‹Ñ… Ð±Ð°Ð·Ð¸ÑÐ¾Ð²/Ð´ÐµÐ¼Ð¾Ð³Ñ€Ð°Ñ„Ð¸Ñ‡ÐµÑÐºÐ¸Ñ… Ð¿Ð¾Ð¿Ñ€Ð°Ð²Ð¾Ðº Ð·Ð½Ð°Ñ‡Ð¸Ð¼Ñ‹Ðµ Ð°ÑÑÐ¾Ñ†Ð¸Ð°Ñ†Ð¸Ð¸ Ð¸ out-of-sample Ñ‚Ð¾Ñ‡Ð½Ð¾ÑÑ‚ÑŒ ÑÑ‚Ñ€ÐµÐ¼ÑÑ‚ÑÑ Ðº Ð½ÑƒÐ»ÑŽ; Ð¾ÑÑ‚Ð°Ð²ÑˆÐ¸ÐµÑÑ ÑÐ¸Ð³Ð½Ð°Ð»Ñ‹ ÐµÐ´Ð¸Ð½Ð¸Ñ‡Ð½Ñ‹ Ð¸ Ð½ÐµÐ¿Ð¾ÑÐ»ÐµÐ´Ð¾Ð²Ð°Ñ‚ÐµÐ»ÑŒÐ½Ñ‹.",
+      "sources": []
+    }
+  ]
+}

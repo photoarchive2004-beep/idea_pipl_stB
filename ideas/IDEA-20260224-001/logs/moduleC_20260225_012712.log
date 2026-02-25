@@ -1,0 +1,3 @@
+[QC] papers_total=300 kept_after_domain=207 allowed_domains=['eco_evo'] no_abstract_pct=0.157
+[QC] domain_counts={'biomed': 91, 'eco_evo': 167, 'social': 4, 'tech': 2, 'other': 36} idea_domains=['eco_evo'] idea_conf=1.0
+[NEED] LLM: Missing evidence_rows.

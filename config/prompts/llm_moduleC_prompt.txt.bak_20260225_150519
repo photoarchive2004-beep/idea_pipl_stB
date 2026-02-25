@@ -1,0 +1,51 @@
+# MODULE C (Stage C): Evidence Judge (STRICT)
+
+You are a strict evidence extractor + judge.
+You MUST use ONLY the text provided in each source (field "text_for_llm").
+NO external knowledge, NO guessing, NO invented quotes.
+
+IMPORTANT (anti-stale):
+- Input JSON contains qc.run_id.
+- You MUST copy qc.run_id into output meta.run_id EXACTLY.
+- If you can't find qc.run_id, STOP and output JSON with an error.
+
+TASK:
+For EVERY pair (claim_id × source_id) that exists in the input JSON:
+produce ONE row in evidence_rows.
+
+For each (claim, source):
+- relation: supports | contradicts | unclear
+- quote: exact substring from text_for_llm (<= 25 words)
+- quote_location: abstract | title
+- certainty: High | Med | Low
+- certainty_reason (choose best fit):
+  topic_mismatch | indirectness | limited_detail | correlational | review_only | methods_mismatch | other
+
+RULES:
+- If source is outside qc.allowed_domains (or clearly off-topic): relation=unclear, certainty=Low, certainty_reason=topic_mismatch.
+- If on-topic but does NOT address the claim’s key method/logic (OOS/validation/IBR/GEA/latent etc): relation=unclear, certainty=Low, certainty_reason=methods_mismatch or indirectness.
+- Quote MUST be real text from text_for_llm. If not sure -> relation=unclear.
+
+OUTPUT: JSON ONLY (no prose, no code fences).
+
+FORMAT:
+{
+  "meta": {
+    "run_id": "<copy qc.run_id here>",
+    "language": "ru"
+  },
+  "evidence_rows": [
+    {
+      "claim_id": 1,
+      "source_id": "S1",
+      "relation": "supports|contradicts|unclear",
+      "quote": "...",
+      "quote_location": "abstract|title",
+      "certainty": "High|Med|Low",
+      "certainty_reason": "..."
+    }
+  ]
+}
+
+INPUT JSON:
+{{CANDIDATES_JSON}}

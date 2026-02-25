@@ -374,86 +374,17 @@ def dedup_papers(papers: List[Paper]) -> List[Paper]:
     return list(best.values())
 
 
-def validate_llm(obj: Dict[str, Any], candidates: List[Dict[str, Any]], run_id: str) -> Tuple[bool, str, List[Dict[str, Any]]]:
+def validate_llm(obj: Dict[str, Any]) -> Tuple[bool, str, List[Dict[str, Any]]]:
     if not isinstance(obj, dict):
         return False, "Response is not a JSON object.", []
-
-    meta = obj.get("meta") or {}
-    rid = ""
-    if isinstance(meta, dict):
-        rid = str(meta.get("run_id", "")).strip()
-
-    if not run_id:
-        return False, "Pipeline run_id is missing.", []
-    if rid != run_id:
-        return False, f"run_id mismatch or missing (expected {run_id})", []
-
     rows = obj.get("evidence_rows")
-    if not isinstance(rows, list) or not rows:
-        return False, "Missing evidence_rows.", []
+    if isinstance(rows, list):
+        flat = [x for x in rows if isinstance(x, dict)]
+        if not flat:
+            return False, "evidence_rows is empty.", []
+        return True, "OK", flat
+    return False, "Missing evidence_rows.", []
 
-    allowed_rel = {"supports", "contradicts", "unclear"}
-    allowed_cert = {"High", "Med", "Low"}
-
-    # allowed pairs from candidates
-    allowed_pairs = set()
-    nclaims = 0
-    for c in candidates:
-        cid = int(c.get("claim_id", 0))
-        nclaims = max(nclaims, cid)
-        for s in c.get("sources", []):
-            sid = str(s.get("source_id","")).strip()
-            if sid:
-                allowed_pairs.add((cid, sid))
-
-    flat: List[Dict[str, Any]] = []
-    per_claim = {}
-    seen = set()
-
-    for x in rows:
-        if not isinstance(x, dict):
-            continue
-        try:
-            cid = int(str(x.get("claim_id","")).strip())
-        except Exception:
-            continue
-        sid = str(x.get("source_id","")).strip()
-        if not sid:
-            continue
-        if (cid, sid) not in allowed_pairs:
-            continue
-        if (cid, sid) in seen:
-            continue
-        seen.add((cid, sid))
-
-        rel = str(x.get("relation","unclear")).lower().strip()
-        if rel not in allowed_rel:
-            rel = "unclear"
-
-        cert = str(x.get("certainty","Low")).strip()
-        if cert not in allowed_cert:
-            cert = "Low"
-
-        per_claim[cid] = per_claim.get(cid, 0) + 1
-
-        flat.append({
-            "claim_id": cid,
-            "source_id": sid,
-            "relation": rel,
-            "quote": (x.get("quote") or "")[:260],
-            "quote_location": (x.get("quote_location") or "abstract"),
-            "certainty": cert,
-            "certainty_reason": (x.get("certainty_reason") or "")[:120],
-        })
-
-    if not flat:
-        return False, "No usable rows matched candidates.", []
-
-    missing = [i for i in range(1, nclaims+1) if per_claim.get(i, 0) == 0]
-    if missing:
-        return False, f"Missing rows for claim_id(s): {missing}", []
-
-    return True, "OK", flat
 
 def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
     cols=["claim_id","claim","source_id","doi","title","year","venue","openalex_id","relation","quote","quote_location","certainty","certainty_reason"]
@@ -509,14 +440,6 @@ def main() -> int:
     idea_dir=Path(args.idea)
     in_dir, out_dir, logs_dir = idea_dir/"in", idea_dir/"out", idea_dir/"logs"
     ensure_dir(in_dir); ensure_dir(out_dir); ensure_dir(logs_dir)
-
-    # run_id persistence (prevents using stale ChatGPT answers)
-    run_id_file = out_dir/"run_id_C.txt"
-    if run_id_file.exists():
-        run_id = read_text_utf8_sig(run_id_file).strip() or now_stamp()
-    else:
-        run_id = now_stamp()
-        run_id_file.write_text(run_id, encoding="utf-8")
 
     log_path=logs_dir/f"moduleC_{now_stamp()}.log"
     def log(s:str)->None:
@@ -712,13 +635,13 @@ def main() -> int:
         except Exception:
             obj = {"paste":"Paste ChatGPT JSON here"}
 
-        ok, why, flat = validate_llm(obj, candidates, run_id)
+        ok, why, flat = validate_llm(obj)
         if not ok:
             tpl = Path(__file__).resolve().parents[1]/"config"/"prompts"/"llm_moduleC_prompt.txt"
             packet = json.dumps({"claims": candidates, "qc": qc}, ensure_ascii=False, indent=2)
             prompt = read_text_utf8_sig(tpl).replace("{{CANDIDATES_JSON}}", packet)
             prompt_path.write_text(prompt, encoding="utf-8")
-            llm_path.write_text(json.dumps({"paste":"Paste ChatGPT JSON here (replace this file)","reason_pipeline_waiting": why, "expected_run_id": run_id}, ensure_ascii=False, indent=2), encoding="utf-8")
+            llm_path.write_text(json.dumps({"paste":"Paste ChatGPT JSON here (replace this file)","reason_pipeline_waiting":why}, ensure_ascii=False, indent=2), encoding="utf-8")
             log("[NEED] LLM: " + why)
             return 2
 

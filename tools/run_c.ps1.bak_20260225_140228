@@ -1,9 +1,9 @@
 param(
   [string]$IdeaDir = "",
-  [string]$Mode = ""
+  [string]$Mode = "fast"
 )
 
-try { chcp 65001 | Out-Null } catch {}
+# Windows PowerShell 5.1: принудительно UTF-8 для консоли
 [Console]::InputEncoding  = New-Object System.Text.UTF8Encoding($false)
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $OutputEncoding = [Console]::OutputEncoding
@@ -11,6 +11,7 @@ $ErrorActionPreference = "Stop"
 
 function Say([string]$s){ Write-Host $s }
 
+# Логи лаунчера
 $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 $LogDir = Join-Path $Root "launcher_logs"
@@ -18,7 +19,15 @@ New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $Log = Join-Path $LogDir "runC_last.log"
 "" | Out-File -FilePath $Log -Encoding UTF8
 
-function LogLine([string]$s){ $s | Out-File -FilePath $Log -Append -Encoding UTF8 }
+function LogLine([string]$s){
+  $s | Out-File -FilePath $Log -Append -Encoding UTF8
+}
+
+# mode normalize (PS 5.1 safe)
+if ($null -eq $Mode) { $Mode = "" }
+$Mode = ($Mode + "").Trim().ToLower()
+if ([string]::IsNullOrWhiteSpace($Mode)) { $Mode = "fast" }
+if ($Mode -ne "fast" -and $Mode -ne "deep") { $Mode = "fast" }
 
 function Resolve-IdeaDir([string]$arg) {
   $ideas = Join-Path $Root "ideas"
@@ -50,6 +59,7 @@ function Resolve-IdeaDir([string]$arg) {
            Sort-Object Name -Descending
   $first = $cands | Select-Object -First 1
   if ($first) { return $first.FullName }
+
   throw "В папке ideas нет ни одной IDEA-*"
 }
 
@@ -57,20 +67,30 @@ function Ensure-IdeaLayout([string]$ideaDir){
   New-Item -ItemType Directory -Force -Path (Join-Path $ideaDir "in"),(Join-Path $ideaDir "out"),(Join-Path $ideaDir "logs") | Out-Null
 }
 
+function Extract-JsonObject([string]$text){
+  $i0 = $text.IndexOf("{")
+  $i1 = $text.LastIndexOf("}")
+  if ($i0 -lt 0 -or $i1 -le $i0) { return $null }
+  return $text.Substring($i0, ($i1-$i0+1))
+}
+
 function Restore-StructuredIdeaIfMissing([string]$ideaDir){
   $dst = Join-Path $ideaDir "out\structured_idea.json"
   if (Test-Path $dst) { return $true }
+
   $src = Join-Path $ideaDir "in\llm_response.json"
   if (-not (Test-Path $src)) { return $false }
+
   try {
     $raw = [System.IO.File]::ReadAllText($src, [System.Text.Encoding]::UTF8)
-    $i0 = $raw.IndexOf("{"); $i1 = $raw.LastIndexOf("}")
-    if ($i0 -lt 0 -or $i1 -le $i0) { return $false }
-    $json = $raw.Substring($i0, ($i1-$i0+1))
+    $json = Extract-JsonObject $raw
+    if (-not $json) { return $false }
     [System.IO.File]::WriteAllText($dst, $json, (New-Object System.Text.UTF8Encoding($false)))
     LogLine "[INFO] Restored out\structured_idea.json from in\llm_response.json"
     return $true
-  } catch { return $false }
+  } catch {
+    return $false
+  }
 }
 
 try {
@@ -79,26 +99,10 @@ try {
   Ensure-IdeaLayout $IdeaDir
 
   $ideaName = Split-Path $IdeaDir -Leaf
-  Say "Stage C (Evidence) : $ideaName"
-  Say ""
-
-  $noLLM = $false
-  if ([string]::IsNullOrWhiteSpace($Mode)) {
-    Say "Choose mode:"
-    Say "  1) ChatGPT Deep (recommended, best quality)  [default]"
-    Say "  2) Autonomous (no ChatGPT, low quality)"
-    $sel = Read-Host "Enter 1 or 2 (default 1)"
-    if ([string]::IsNullOrWhiteSpace($sel)) { $sel = "1" }
-    if ($sel.Trim() -eq "2") { $Mode="fast"; $noLLM=$true } else { $Mode="deep"; $noLLM=$false }
-  } else {
-    $Mode = ($Mode + "").Trim().ToLower()
-    if ($Mode -ne "fast" -and $Mode -ne "deep") { $Mode="deep" }
-  }
-
-  Say "Mode: $Mode" + $(if($noLLM){" + no-LLM"}else{""})
+  Say "Stage C launcher: $ideaName"
+  Say "Mode: $Mode (fast/deep)"
   LogLine "[INFO] IDEA=$IdeaDir"
   LogLine "[INFO] MODE=$Mode"
-  LogLine "[INFO] noLLM=$noLLM"
 
   $corpus = Join-Path $IdeaDir "out\corpus.csv"
   if (-not (Test-Path $corpus)) {
@@ -117,15 +121,20 @@ try {
   $script = Join-Path $Root "tools\c_evidence_engine.py"
   if (-not (Test-Path $script)) { throw "Missing tools\c_evidence_engine.py" }
 
-  $args = @($script, "--idea", $IdeaDir, "--mode", $Mode)
-  if ($noLLM) { $args += "--no-llm" }
+  # call python (add --mode only if script supports it)
+  $pyText = ""
+  try { $pyText = [System.IO.File]::ReadAllText($script, [System.Text.Encoding]::UTF8) } catch { $pyText = "" }
+  $hasMode = $false
+  if ($pyText -match "--mode") { $hasMode = $true }
+
+  $args = @($script, "--idea", $IdeaDir)
+  if ($hasMode) { $args += @("--mode", $Mode) }
 
   LogLine ("[CMD] " + $py + " " + ($args -join " "))
   & $py @args 2>&1 | Tee-Object -FilePath $Log -Append | Out-Host
   $rc = $LASTEXITCODE
 
   if ($rc -eq 0) {
-    Say ""
     Say "OK: Stage C complete."
     Say "Outputs: out\evidence_table.csv ; out\evidence_summary.md"
     exit 0
@@ -135,9 +144,8 @@ try {
     $prompt = Join-Path $IdeaDir "out\llm_prompt_C.txt"
     $resp   = Join-Path $IdeaDir "in\llm_evidence.json"
 
-    Say ""
     Say "Need ChatGPT once:"
-    Say "1) Prompt copied to clipboard (Ctrl+V in ChatGPT)"
+    Say "1) Prompt is copied to clipboard (Ctrl+V in ChatGPT)"
     Say "2) Copy ONLY JSON from ChatGPT answer"
     Say "3) Paste JSON into in\llm_evidence.json and save"
     Say "4) Run RUN_C.bat again"
