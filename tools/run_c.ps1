@@ -68,7 +68,7 @@ function Restore-StructuredIdeaIfMissing([string]$ideaDir){
     if ($i0 -lt 0 -or $i1 -le $i0) { return $false }
     $json = $raw.Substring($i0, ($i1-$i0+1))
     [System.IO.File]::WriteAllText($dst, $json, (New-Object System.Text.UTF8Encoding($false)))
-    LogLine "[INFO] Restored out\structured_idea.json from in\llm_response.json"
+    LogLine "[INFO] Восстановлен out\structured_idea.json из in\llm_response.json"
     return $true
   } catch { return $false }
 }
@@ -79,15 +79,15 @@ try {
   Ensure-IdeaLayout $IdeaDir
 
   $ideaName = Split-Path $IdeaDir -Leaf
-  Say "Stage C (Evidence) : $ideaName"
+  Say "Stage C (Evidence): $ideaName"
   Say ""
 
   $noLLM = $false
   if ([string]::IsNullOrWhiteSpace($Mode)) {
-    Say "Choose mode:"
-    Say "  1) ChatGPT Deep (recommended, best quality)  [default]"
-    Say "  2) Autonomous (no ChatGPT, low quality)"
-    $sel = Read-Host "Enter 1 or 2 (default 1)"
+    Say "Выберите режим:"
+    Say "  1) ChatGPT Deep (по умолчанию, лучшее качество)"
+    Say "  2) Autonomous (без ChatGPT)"
+    $sel = Read-Host "Введите 1 или 2 (по умолчанию 1)"
     if ([string]::IsNullOrWhiteSpace($sel)) { $sel = "1" }
     if ($sel.Trim() -eq "2") { $Mode="fast"; $noLLM=$true } else { $Mode="deep"; $noLLM=$false }
   } else {
@@ -95,19 +95,19 @@ try {
     if ($Mode -ne "fast" -and $Mode -ne "deep") { $Mode="deep" }
   }
 
-  Say "Mode: $Mode" + $(if($noLLM){" + no-LLM"}else{""})
+  Say "Режим: $Mode" + $(if($noLLM){" + no-LLM"}else{""})
   LogLine "[INFO] IDEA=$IdeaDir"
   LogLine "[INFO] MODE=$Mode"
   LogLine "[INFO] noLLM=$noLLM"
 
   $corpus = Join-Path $IdeaDir "out\corpus.csv"
   if (-not (Test-Path $corpus)) {
-    Say "ERROR: out\corpus.csv not found. Run RUN_B.bat first."
+    Say "ОШИБКА: out\corpus.csv не найден. Сначала запустите RUN_B.bat."
     exit 1
   }
 
   if (-not (Restore-StructuredIdeaIfMissing $IdeaDir)) {
-    Say "ERROR: out\structured_idea.json not found and restore failed. Run RUN_A then RUN_B then RUN_C."
+    Say "ОШИБКА: out\structured_idea.json не найден и восстановление не удалось. Запустите RUN_A, затем RUN_B и снова RUN_C."
     exit 1
   }
 
@@ -126,8 +126,8 @@ try {
 
   if ($rc -eq 0) {
     Say ""
-    Say "OK: Stage C complete."
-    Say "Outputs: out\evidence_table.csv ; out\evidence_summary.md"
+    Say "Готово: Stage C завершён."
+    Say "Файлы: out\evidence_table.csv ; out\evidence_summary.md"
     exit 0
   }
 
@@ -136,11 +136,11 @@ try {
     $resp   = Join-Path $IdeaDir "in\llm_evidence.json"
 
     Say ""
-    Say "Need ChatGPT once:"
-    Say "1) Prompt copied to clipboard (Ctrl+V in ChatGPT)"
-    Say "2) Copy ONLY JSON from ChatGPT answer"
-    Say "3) Paste JSON into in\llm_evidence.json and save"
-    Say "4) Run RUN_C.bat again"
+    Say "Нужен один ответ ChatGPT (режим Deep):"
+    Say "1) Промпт скопирован в буфер (вставьте Ctrl+V в ChatGPT)."
+    Say "2) Скопируйте ИСКЛЮЧИТЕЛЬНО JSON из ответа ChatGPT."
+    Say "3) Вставьте JSON в in\llm_evidence.json и сохраните файл."
+    Say "4) Запустите RUN_C.bat повторно."
 
     if (Test-Path $prompt) {
       Set-Clipboard -Value ([System.IO.File]::ReadAllText($prompt,[System.Text.Encoding]::UTF8))
@@ -152,12 +152,12 @@ try {
     exit 2
   }
 
-  Say ("ERROR: Stage C failed, exit code=" + $rc + ". See launcher_logs\runC_last.log")
+  Say ("ОШИБКА: Stage C завершился с кодом=" + $rc + ". Смотрите launcher_logs\runC_last.log")
   Start-Process notepad.exe -ArgumentList $Log | Out-Null
   exit 1
 }
 catch {
-  Say "ERROR: launcher crashed. Opening log."
+  Say "ОШИБКА: launcher аварийно завершился. Открываю лог."
   $_ | Out-String | Out-File -FilePath $Log -Append -Encoding UTF8
   Start-Process notepad.exe -ArgumentList $Log | Out-Null
   exit 1
