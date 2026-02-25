@@ -34,7 +34,7 @@ echo.
 if "%RC%"=="0" (
   echo [OK] Stage C1 завершен успешно.
 ) else if "%RC%"=="2" (
-  echo [WAIT] Ожидание ответа ChatGPT. Это нормальный шаг первого запуска.
+  echo [WAIT] Жду ответ в RESPONSE.json (первый запуск завершен корректно).
 ) else (
   echo [ERR] Stage C1 завершился с ошибкой. ExitCode=%RC%
   echo [HINT] Проверьте launcher_logs\LAST_LOG.txt и logs\moduleC1_LAST.log

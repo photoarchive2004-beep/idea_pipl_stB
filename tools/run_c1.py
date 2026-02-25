@@ -414,6 +414,8 @@ def preclean_corpus(rows: List[Dict[str, str]], oa: ApiClient, secrets: Dict[str
 
 
 def generate_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
+    n_candidates = len(candidates)
+    min_target = min(max_abs, min(100, max(40, round(0.35 * n_candidates))))
     reduced_candidates = [
         {
             "paper_id": c["paper_id"],
@@ -421,15 +423,13 @@ def generate_screening_prompt(idea_text: str, structured: Dict[str, Any], candid
             "year": c["year"],
             "doi": c["doi"],
             "venue": c["venue"],
-            "abstract_snippet": c["abstract_snippet"],
             "first_author": c.get("first_author", ""),
+            "abstract_snippet": c["abstract_snippet"],
+            "domain": c.get("domain", ""),
+            "field": c.get("field", ""),
+            "subfield": c.get("subfield", ""),
             "downloadability_hint": c.get("downloadability_hint", "NONE"),
             "oa_pdf_candidates": c.get("oa_pdf_candidates", []),
-            "primary_topic": {
-                "domain": c.get("domain", ""),
-                "field": c.get("field", ""),
-                "subfield": c.get("subfield", ""),
-            },
         }
         for c in candidates
     ]
@@ -438,33 +438,35 @@ def generate_screening_prompt(idea_text: str, structured: Dict[str, Any], candid
         "structured_idea": structured,
         "max_abstracts": max_abs,
         "max_pdfs": max_pdf,
-        "strict_contract": {
+        "min_abstracts_target": min_target,
+        "rules": [
+            "Верни только JSON, без markdown и без поясняющего текста.",
+            "Выбирай ТОЛЬКО paper_id из списка candidates. Никаких paper_id/doi из головы.",
+            "Если select_for_pdf=1, то обязательно select_for_abstract=1.",
+            "Разделяй выбор по tier: core, support, background.",
+            f"Старайся выбрать НЕ МЕНЬШЕ min_abstracts_target={min_target} для абстрактов, если есть релевантные.",
+            "Если выбрано меньше min_abstracts_target — заполни shortfall_reason.",
+            "Для PDF приоритет HIGH/MED downloadability_hint и oa_pdf_candidates; если OA мало — заполни pdf_shortfall_reason.",
+            "Если сокращение неоднозначно между доменами — ориентируйся на контекст идеи и domain/field/subfield кандидата, иначе исключай.",
+            f"Не превышай max_abstracts={max_abs} и max_pdfs={max_pdf}.",
+        ],
+        "strict_response_contract": {
             "selected": [
                 {
                     "paper_id": "<id из candidates>",
                     "select_for_abstract": 1,
                     "select_for_pdf": 0,
-                    "reason": "коротко по-русски",
+                    "tier": "core|support|background",
+                    "reason": "коротко"
                 }
             ],
+            "shortfall_reason": "optional",
+            "pdf_shortfall_reason": "optional",
+            "notes": "optional"
         },
-        "rules": [
-            "Верни только JSON без поясняющего текста.",
-            "paper_id только из списка candidates.",
-            "select_for_pdf=1 только если select_for_abstract=1.",
-            "Приоритет релевантности идее + вероятности скачивания OA PDF.",
-            "Для PDF в первую очередь выбирай HIGH/MED downloadability_hint (репозитории, PMC, arXiv, Zenodo и т.д.).",
-            f"Не более {max_abs} с select_for_abstract=1.",
-            f"Не более {max_pdf} с select_for_pdf=1.",
-            "Не добавляй новые DOI/ID и не меняй paper_id.",
-        ],
         "candidates": reduced_candidates,
     }
-    return (
-        "Ты выполняешь семантический screening научных работ по идее. "
-        "Нужно строго выбрать релевантные статьи по смыслу и вернуть только JSON.\n\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
-    )
+    return "Универсальный screening статей для идеи. Верни только JSON строго по контракту.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def parse_screening_response(path: Path) -> Dict[str, Any]:
@@ -487,6 +489,7 @@ def validate_screening_response(data: Dict[str, Any], candidates: List[Dict[str,
     selected: List[Dict[str, Any]] = []
     abs_count = 0
     pdf_count = 0
+    tiers = {"core", "support", "background"}
 
     for i, row in enumerate(data.get("selected") or []):
         if not isinstance(row, dict):
@@ -498,6 +501,10 @@ def validate_screening_response(data: Dict[str, Any], candidates: List[Dict[str,
             continue
         a = int(row.get("select_for_abstract", 0))
         p = int(row.get("select_for_pdf", 0))
+        tier = normalize_text(str(row.get("tier", "background"))).lower() or "background"
+        if tier not in tiers:
+            errors.append(f"{pid}: tier должен быть core/support/background")
+            continue
         if p == 1 and a != 1:
             errors.append(f"{pid}: select_for_pdf=1 требует select_for_abstract=1")
             continue
@@ -508,14 +515,7 @@ def validate_screening_response(data: Dict[str, Any], candidates: List[Dict[str,
             abs_count += 1
         if p == 1:
             pdf_count += 1
-        selected.append(
-            {
-                **c_map[pid],
-                "select_for_abstract": a,
-                "select_for_pdf": p,
-                "reason": normalize_text(row.get("reason", "")) or "без причины",
-            }
-        )
+        selected.append({**c_map[pid], "select_for_abstract": a, "select_for_pdf": p, "tier": tier, "reason": normalize_text(row.get("reason", "")) or "без причины"})
 
     if abs_count > max_abs:
         errors.append(f"Превышен лимит abstracts: {abs_count} > {max_abs}")
@@ -547,16 +547,25 @@ def fetch_crossref_abstract(doi: str, cr: ApiClient, mailto: str) -> Tuple[str, 
     return crossref_to_text((j.get("message") or {}).get("abstract", "")), u
 
 
-def fetch_semantic_scholar(doi: str, title: str, s2: ApiClient, api_key: str) -> Tuple[Dict[str, Any], str]:
+def fetch_semantic_scholar_pdf_url(doi: str, title: str, s2: ApiClient, api_key: str) -> Tuple[str, str]:
     headers = {"x-api-key": api_key} if api_key else {}
     if doi:
-        u = f"{SEMANTIC_SCHOLAR_BASE}/paper/DOI:{requests.utils.quote(doi, safe='')}?fields=abstract,openAccessPdf"
-        return s2.get_json(u, headers=headers, retries=1, retry_on_404=False), u
+        u = f"{SEMANTIC_SCHOLAR_BASE}/paper/DOI:{requests.utils.quote(doi, safe='')}?fields=openAccessPdf"
+        try:
+            j = s2.get_json(u, headers=headers, retries=2, retry_on_404=False)
+            return normalize_text(((j.get("openAccessPdf") or {}).get("url", ""))), u
+        except Exception:
+            return "", u
     q = requests.utils.quote(title[:140])
-    u = f"{SEMANTIC_SCHOLAR_BASE}/paper/search?query={q}&limit=1&fields=abstract,openAccessPdf,title"
-    j = s2.get_json(u, headers=headers, retries=1, retry_on_404=False)
-    data = j.get("data") or []
-    return (data[0] if data else {}), u
+    u = f"{SEMANTIC_SCHOLAR_BASE}/paper/search?query={q}&limit=1&fields=openAccessPdf,title"
+    try:
+        j = s2.get_json(u, headers=headers, retries=2, retry_on_404=False)
+        data = j.get("data") or []
+        if data:
+            return normalize_text(((data[0].get("openAccessPdf") or {}).get("url", ""))), u
+    except Exception:
+        return "", u
+    return "", u
 
 
 def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str) -> Tuple[List[str], str]:
@@ -570,8 +579,7 @@ def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str) -> Tuple[List[
         x = normalize_text(loc.get("url_for_pdf", ""))
         if x:
             urls.append(x)
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for x in urls:
         if x not in seen:
             seen.add(x)
@@ -582,7 +590,7 @@ def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str) -> Tuple[List[
 def classify_pdf_url(url: str) -> str:
     u = (url or "").lower()
     high_tokens = ["pmc", "pubmedcentral", "arxiv.org", "zenodo.org", "hal.science", "repository", "eprints", "figshare", "osf.io"]
-    low_tokens = ["sciencedirect", "wiley", "oup", "springer", "nature.com", "tandfonline", "linkinghub", "pdfdirect"]
+    low_tokens = ["sciencedirect", "wiley", "oup", "elsevier", "springer", "nature.com", "tandfonline", "linkinghub", "pdfdirect"]
     if any(t in u for t in high_tokens):
         return "HIGH"
     if any(t in u for t in low_tokens):
@@ -594,8 +602,7 @@ def classify_pdf_url(url: str) -> str:
 
 def sort_pdf_candidates(urls: List[str]) -> List[str]:
     priority = {"HIGH": 0, "MED": 1, "LOW": 2, "NONE": 3}
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for x in urls:
         if x and x not in seen:
             seen.add(x)
@@ -616,13 +623,24 @@ def choose_hint(urls: List[str]) -> str:
     return "NONE"
 
 
-def windows_open(path: Path) -> None:
-    for cmd in (["explorer", str(path)], ["notepad", str(path)]):
+def open_prepare_artifacts(chat_dir: Path, prompt: Path, response: Path) -> None:
+    try:
+        subprocess.Popen(["explorer", str(chat_dir)])
+    except Exception:
+        pass
+    for p in [prompt, response]:
         try:
-            subprocess.Popen(cmd)
-            return
+            subprocess.Popen(["notepad", str(p)])
         except Exception:
-            continue
+            pass
+
+
+def copy_prompt_file_to_clipboard(prompt_path: Path) -> bool:
+    try:
+        cmd = f'cmd /c type "{prompt_path}" | clip'
+        return subprocess.call(cmd, shell=True) == 0
+    except Exception:
+        return False
 
 
 def build_cite_short(first_author: str, year: str, title: str) -> str:
@@ -655,7 +673,7 @@ def ensure_pdf_valid(path: Path, min_size: int = 30 * 1024) -> Tuple[bool, str]:
 
 def download_pdf(url: str, path: Path, timeout: int) -> Tuple[bool, str, int, str]:
     try:
-        with requests.get(url, timeout=timeout, stream=True, allow_redirects=True) as r:
+        with requests.get(url, timeout=max(timeout, 30), stream=True, allow_redirects=True) as r:
             code = r.status_code
             ctype = (r.headers.get("Content-Type", "") or "").lower()
             if code >= 400:
@@ -684,313 +702,281 @@ def save_abstract(path: Path, text: str) -> bool:
     return True
 
 
-def pick_without_llm(candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> List[Dict[str, Any]]:
-    ordered = sorted(candidates, key=lambda x: (-x["score"], -x["cited_by"], x["paper_id"]))
-    abs_ids = {x["paper_id"] for x in ordered[:max_abs]}
-    pdf_ids = {x["paper_id"] for x in ordered if x.get("oa_pdf_url") or x.get("doi")}
-    pdf_ids = set(list(pdf_ids)[:max_pdf])
-    out = []
-    for c in ordered:
-        out.append({**c, "select_for_abstract": 1 if c["paper_id"] in abs_ids else 0, "select_for_pdf": 1 if c["paper_id"] in pdf_ids else 0, "reason": "автовыбор без ChatGPT"})
-    return out
+def load_json_if_exists(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding='utf-8', errors='replace'))
+    except Exception:
+        return default
+
+
+def response_ready(resp_path: Path) -> bool:
+    if not resp_path.exists():
+        return False
+    raw = normalize_text(resp_path.read_text(encoding='utf-8', errors='replace'))
+    return raw not in ('', '{}', '{"selected": []}')
+
+
+def repair_manual_pdfs_only(papers_dir: Path, pdf_dir: Path, logger: RunLogger) -> int:
+    qpath = papers_dir / 'pdf_manual_queue.csv'
+    if not qpath.exists():
+        logger.info('Режим repair: pdf_manual_queue.csv не найден.')
+        return 0
+    rows = list(csv.DictReader(qpath.open('r', encoding='utf-8-sig', newline='')))
+    copied = 0
+    for row in rows:
+        if (row.get('status') or '') != 'MISSING':
+            continue
+        src_val = normalize_text(row.get('manual_pdf_local_path', ''))
+        if not src_val:
+            continue
+        src = Path(src_val)
+        if src.exists():
+            dst = pdf_dir / f"{row.get('paper_id','')}.pdf"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            row['status'] = 'FOUND_MANUAL'
+            copied += 1
+    write_csv(qpath, rows, ['cite_short', 'paper_id', 'doi', 'title', 'year', 'first_author', 'tried_urls', 'manual_pdf_local_path', 'status', 'notes'])
+    logger.info(f'Режим repair: подхвачено ручных PDF: {copied}')
+    return 0
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Stage C1: Selection + Harvest (Selection + ChatGPT + Harvest)")
-    ap.add_argument("--idea-dir", default="")
-    ap.add_argument("--screening", choices=["chatgpt", "none"], default="chatgpt")
-    ap.add_argument("--max-candidates", type=int, default=400)
-    ap.add_argument("--max-abstracts", type=int, default=120)
-    ap.add_argument("--max-pdfs", type=int, default=40)
-    ap.add_argument("--timeout", type=int, default=35)
-    ap.add_argument("--force", action="store_true")
-    ap.add_argument("--rps-openalex", type=float, default=2.0)
-    ap.add_argument("--rps-unpaywall", type=float, default=1.5)
-    ap.add_argument("--rps-crossref", type=float, default=1.0)
-    ap.add_argument("--rps-europepmc", type=float, default=1.5)
-    ap.add_argument("--rps-s2", type=float, default=1.0)
+    ap = argparse.ArgumentParser(description='Stage C1: универсальный ChatGPT-screening + harvest')
+    ap.add_argument('--idea-dir', default='')
+    ap.add_argument('--screening', choices=['chatgpt', 'none'], default='chatgpt')
+    ap.add_argument('--max-candidates', type=int, default=400)
+    ap.add_argument('--max-abstracts', type=int, default=120)
+    ap.add_argument('--max-pdfs', type=int, default=40)
+    ap.add_argument('--timeout', type=int, default=40)
+    ap.add_argument('--force', action='store_true')
+    ap.add_argument('--repair-manual-pdfs', action='store_true')
+    ap.add_argument('--rps-openalex', type=float, default=2.0)
+    ap.add_argument('--rps-unpaywall', type=float, default=1.5)
+    ap.add_argument('--rps-crossref', type=float, default=1.0)
+    ap.add_argument('--rps-europepmc', type=float, default=1.5)
+    ap.add_argument('--rps-s2', type=float, default=1.0)
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
     idea_dir = find_idea_dir(root, args.idea_dir or None)
-    logs_dir = idea_dir / "logs"
-    in_dir = idea_dir / "in"
-    papers_dir = in_dir / "papers"
-    manifests_dir = papers_dir / "manifests"
-    out_dir = idea_dir / "out"
-    abstracts_dir = papers_dir / "abstracts"
-    pdf_dir = papers_dir / "pdfs"
+    logs_dir, in_dir, papers_dir, manifests_dir = idea_dir / 'logs', idea_dir / 'in', idea_dir / 'in' / 'papers', idea_dir / 'in' / 'papers' / 'manifests'
+    out_dir, abstracts_dir, pdf_dir = idea_dir / 'out', idea_dir / 'in' / 'papers' / 'abstracts', idea_dir / 'in' / 'papers' / 'pdfs'
+    c1_chat_dir = in_dir / 'c1_chatgpt'
+    prompt_path, resp_path = c1_chat_dir / 'PROMPT.txt', c1_chat_dir / 'RESPONSE.json'
+    candidates_path = papers_dir / 'candidates.json'
+    checkpoint_path = out_dir / '_moduleC1_checkpoint.json'
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_log = logs_dir / f"moduleC1_{ts}.log"
-    last_log = logs_dir / "moduleC1_LAST.log"
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_log = logs_dir / f'moduleC1_{ts}.log'
+    last_log = logs_dir / 'moduleC1_LAST.log'
     logger = RunLogger(run_log)
-
+    manifests_dir.mkdir(parents=True, exist_ok=True)
     manifest_rows: List[Dict[str, Any]] = []
     error_rows: List[Dict[str, Any]] = []
 
     try:
-        logger.info("=== Stage C1: Selection + Harvest ===")
-        logger.info(f"IDEA_DIR={idea_dir}")
+        logger.info('=== Stage C1 ===')
+        logger.info(f'IDEA_DIR={idea_dir}')
+        if args.repair_manual_pdfs:
+            return repair_manual_pdfs_only(papers_dir, pdf_dir, logger)
 
+        harvest_mode = response_ready(resp_path)
         secrets = load_secrets(root)
-        corpus_path = out_dir / "corpus.csv"
-        if not corpus_path.exists():
-            raise FileNotFoundError(f"Не найден обязательный файл: {corpus_path}")
+        oa = ApiClient('OpenAlex', args.rps_openalex, args.timeout, logger)
+        up = ApiClient('Unpaywall', args.rps_unpaywall, args.timeout, logger)
+        cr = ApiClient('Crossref', args.rps_crossref, args.timeout, logger)
+        epmc = ApiClient('EuropePMC', args.rps_europepmc, args.timeout, logger)
+        s2 = ApiClient('SemanticScholar', args.rps_s2, args.timeout, logger)
 
-        logger.info("[1/6] Читаю corpus.csv")
-        rows = load_corpus(corpus_path)
-        idea_text, structured, keywords = extract_idea_context(idea_dir)
-
-        oa = ApiClient("OpenAlex", args.rps_openalex, args.timeout, logger)
-        up = ApiClient("Unpaywall", args.rps_unpaywall, args.timeout, logger)
-        cr = ApiClient("Crossref", args.rps_crossref, args.timeout, logger)
-        epmc = ApiClient("EuropePMC", args.rps_europepmc, args.timeout, logger)
-        s2 = ApiClient("SemanticScholar", args.rps_s2, args.timeout, logger)
-
-        candidates, rejected, stats = preclean_corpus(rows, oa, secrets, keywords, logger, args.max_candidates)
-        logger.info(f"[2/6] Дедуп/доменные фильтры: было={stats['corpus_n']} => стало={stats['after_domain_filter_n']}")
-        logger.info("[3/6] Подготовка кандидатов и обогащение OA-линками")
-        for c in candidates:
-            urls = []
-            if c.get("oa_pdf_url"):
-                urls.append(c["oa_pdf_url"])
-            if c.get("doi") and secrets.get("UNPAYWALL_EMAIL"):
-                try:
-                    xs, _ = fetch_unpaywall_pdf_urls(c["doi"], up, secrets["UNPAYWALL_EMAIL"])
-                    urls.extend(xs)
-                except Exception as exc:
-                    error_rows.append({"paper_id": c["paper_id"], "step": "unpaywall_enrich", "url": "", "http_code": "", "message": str(exc), "doi": c.get("doi", ""), "openalex_id": c.get("openalex_id", "")})
-            if c.get("pmid"):
-                try:
-                    xs, _ = fetch_europepmc_pdf_urls(c["pmid"], epmc)
-                    urls.extend(xs)
-                except Exception as exc:
-                    error_rows.append({"paper_id": c["paper_id"], "step": "europepmc_enrich", "url": "", "http_code": "", "message": str(exc), "doi": c.get("doi", ""), "openalex_id": c.get("openalex_id", "")})
-            c["oa_pdf_candidates"] = sort_pdf_candidates(urls)[:3]
-            c["downloadability_hint"] = choose_hint(c["oa_pdf_candidates"])
-            c["why_in_candidates"] = f"score={c.get('score', 0)}; cited_by={c.get('cited_by', 0)}; domain_match={c.get('domain_match_score', 0)}"
-
-        write_json(papers_dir / "candidates.json", candidates)
-        write_json(papers_dir / "preselection_candidates.json", candidates)
-        write_csv(papers_dir / "preselection_rejected.csv", rejected, ["index", "title", "doi", "openalex_id", "reason"])
-
-        c1_chat_dir = in_dir / "c1_chatgpt"
-        prompt_path = c1_chat_dir / "PROMPT.txt"
-        resp_path = c1_chat_dir / "RESPONSE.json"
-
-        selected: List[Dict[str, Any]] = []
-        if args.screening == "none":
-            selected = pick_without_llm(candidates, args.max_abstracts, args.max_pdfs)
-            logger.warn("Режим без ChatGPT включён вручную (--screening none)")
-        else:
-            logger.info("[4/6] ChatGPT screening")
-            needs_wait = (not resp_path.exists()) or normalize_text(resp_path.read_text(encoding="utf-8", errors="replace")) in ("", "{}", '{"selected": []}')
-            if needs_wait:
+        if not harvest_mode:
+            corpus_path = out_dir / 'corpus.csv'
+            if not corpus_path.exists():
+                raise FileNotFoundError(f'Не найден обязательный файл: {corpus_path}')
+            logger.info('[1/6] Читаю corpus.csv')
+            rows = load_corpus(corpus_path)
+            idea_text, structured, keywords = extract_idea_context(idea_dir)
+            candidates, rejected, stats = preclean_corpus(rows, oa, secrets, keywords, logger, args.max_candidates)
+            logger.info(f"[2/6] Дедуп/фильтры => осталось {len(candidates)}")
+            logger.info('[3/6] Готовлю candidates.json и PROMPT')
+            for c in candidates:
+                urls = []
+                if c.get('oa_pdf_url'):
+                    urls.append(c['oa_pdf_url'])
+                if c.get('doi') and secrets.get('UNPAYWALL_EMAIL'):
+                    try:
+                        xs, _ = fetch_unpaywall_pdf_urls(c['doi'], up, secrets['UNPAYWALL_EMAIL'])
+                        urls.extend(xs)
+                    except Exception as exc:
+                        error_rows.append({'paper_id': c['paper_id'], 'step': 'unpaywall_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': c.get('doi', ''), 'openalex_id': c.get('openalex_id', '')})
+                if c.get('pmid'):
+                    try:
+                        xs, _ = fetch_europepmc_pdf_urls(c['pmid'], epmc)
+                        urls.extend(xs)
+                    except Exception as exc:
+                        error_rows.append({'paper_id': c['paper_id'], 'step': 'europepmc_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': c.get('doi', ''), 'openalex_id': c.get('openalex_id', '')})
+                if not urls and (c.get('doi') or c.get('title')):
+                    s2u, _ = fetch_semantic_scholar_pdf_url(c.get('doi', ''), c.get('title', ''), s2, secrets.get('S2_API_KEY', ''))
+                    if s2u:
+                        urls.append(s2u)
+                c['oa_pdf_candidates'] = sort_pdf_candidates(urls)[:3]
+                c['downloadability_hint'] = choose_hint(c['oa_pdf_candidates'])
+            write_json(candidates_path, candidates)
+            write_csv(papers_dir / 'preselection_rejected.csv', rejected, ['index', 'title', 'doi', 'openalex_id', 'reason'])
+            write_json(checkpoint_path, {'phase': 'PREPARE_DONE', 'stats': stats, 'idea_dir': str(idea_dir), 'ts': ts})
+            if args.screening == 'chatgpt':
                 c1_chat_dir.mkdir(parents=True, exist_ok=True)
                 prompt = generate_screening_prompt(idea_text, structured, candidates, args.max_abstracts, args.max_pdfs)
-                prompt_path.write_text(prompt, encoding="utf-8")
+                prompt_path.write_text(prompt, encoding='utf-8')
                 if not resp_path.exists():
-                    resp_path.write_text('{\n  "selected": []\n}\n', encoding="utf-8")
-                copied = copy_to_clipboard(prompt)
-                windows_open(c1_chat_dir)
-                windows_open(prompt_path)
-                windows_open(resp_path)
-                logger.info(f"Prompt для ChatGPT создан: {prompt_path}")
-                print("\n1) Вставьте PROMPT в ChatGPT\n2) Ответ вставьте в RESPONSE.json\n3) Запустите RUN_C1 ещё раз\n")
+                    resp_path.write_text('{\n  "selected": []\n}\n', encoding='utf-8')
+                (c1_chat_dir / 'README_WHAT_TO_DO.txt').write_text('1) Откройте PROMPT.txt и отправьте в ChatGPT.\n2) Вставьте JSON-ответ в RESPONSE.json.\n3) Запустите RUN_C1.bat повторно.\n', encoding='utf-8')
+                copied = copy_prompt_file_to_clipboard(prompt_path)
+                open_prepare_artifacts(c1_chat_dir, prompt_path, resp_path)
+                logger.info('[4/6] Ожидаю ответ ChatGPT (папка/файлы открыты)')
+                print('\nЖду ответ в RESPONSE.json. Запустите RUN_C1 повторно.\n')
                 if copied:
-                    print("Prompt скопирован в буфер обмена.")
+                    print('PROMPT скопирован в буфер обмена.')
                 return 2
 
+        logger.info('[4/6] HARVEST: использую готовые candidates + RESPONSE')
+        candidates = load_json_if_exists(candidates_path, [])
+        if not candidates:
+            raise RuntimeError('Не найден candidates.json для HARVEST. Сначала выполните PREPARE.')
+        c_map = {c['paper_id']: c for c in candidates}
+        stats = (load_json_if_exists(checkpoint_path, {}).get('stats') or {'corpus_n': 0, 'after_dedup_n': 0, 'after_domain_filter_n': len(candidates)})
+        if args.screening == 'none':
+            selected = [{**c, 'select_for_abstract': 1 if i < args.max_abstracts else 0, 'select_for_pdf': 1 if i < args.max_pdfs else 0, 'tier': 'support', 'reason': 'автовыбор'} for i, c in enumerate(candidates)]
+        else:
             raw = parse_screening_response(resp_path)
             selected, validation_errors = validate_screening_response(raw, candidates, args.max_abstracts, args.max_pdfs)
             if validation_errors:
-                invalid_path = c1_chat_dir / "RESPONSE.INVALID.json"
-                invalid_path.write_text(resp_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
-                msg = "\n".join(f"- {e}" for e in validation_errors)
-                logger.err("Невалидный JSON-ответ ChatGPT. Исправьте и запустите снова.")
-                logger.err(msg)
-                windows_open(resp_path)
-                print(f"\nОтвет не прошёл валидацию. Копия сохранена: {invalid_path}\n{msg}\n")
-                return 1
+                write_json(c1_chat_dir / 'RESPONSE.INVALID.json', {'errors': validation_errors, 'response': raw})
+                raise RuntimeError('RESPONSE.json не прошел валидацию; см. RESPONSE.INVALID.json')
+        selected_abs = [x for x in selected if int(x.get('select_for_abstract', 0)) == 1]
+        selected_pdf = [x for x in selected if int(x.get('select_for_pdf', 0)) == 1]
+        write_csv(papers_dir / 'selection.csv', selected, ['paper_id', 'title', 'year', 'doi', 'openalex_id', 'first_author', 'tier', 'downloadability_hint', 'select_for_abstract', 'select_for_pdf', 'reason', 'domain', 'field', 'subfield'])
+        write_jsonl(papers_dir / 'papers.jsonl', selected)
 
-        write_csv(papers_dir / "selection.csv", selected, ["paper_id", "title", "year", "doi", "openalex_id", "first_author", "tier", "downloadability_hint", "select_for_abstract", "select_for_pdf", "reason", "domain", "field", "subfield"])
-        write_jsonl(papers_dir / "papers.jsonl", selected)
-
-        selected_abs = [x for x in selected if x["select_for_abstract"] == 1]
-        selected_pdf = [x for x in selected if x["select_for_pdf"] == 1]
-        if len(selected_abs) < 80:
-            logger.warn(f"Выбрано мало абстрактов: {len(selected_abs)} (<80)")
-
+        reason_counter: Counter[str] = Counter()
         abs_ok = 0
-        pdf_ok = 0
-        reason_counter = Counter()
-
-        logger.info("[5/6] Harvest abstracts")
+        logger.info('[5/6] Качаю абстракты')
         for i, item in enumerate(selected_abs, start=1):
-            pid = item["paper_id"]
-            row = item.get("source_row") or {}
-            abs_path = abstracts_dir / f"{pid}.txt"
+            pid = item['paper_id']
+            abs_path = abstracts_dir / f'{pid}.txt'
+            if abs_path.exists() and not args.force:
+                abs_ok += 1
+                logger.info(f'[abs {i}/{len(selected_abs)}] {pid}: RESUME_OK')
+                continue
             got = False
-            corpus_abs = normalize_text((row or {}).get("abstract", ""))
+            corpus_abs = normalize_text((c_map.get(pid) or {}).get('source_row', {}).get('abstract', ''))
             if len(corpus_abs) >= 200 and save_abstract(abs_path, corpus_abs):
                 got = True
                 abs_ok += 1
-                manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "corpus", "url": ""})
             if not got:
                 try:
-                    txt, u = fetch_openalex_abstract(item, oa, secrets)
+                    txt, _ = fetch_openalex_abstract(item, oa, secrets)
                     if save_abstract(abs_path, txt):
                         got = True
                         abs_ok += 1
-                        manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "openalex_inverted_index", "url": u})
                 except Exception as exc:
-                    error_rows.append({"paper_id": pid, "step": "openalex_abstract", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
-            if not got and item.get("pmid"):
+                    error_rows.append({'paper_id': pid, 'step': 'openalex_abstract', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+            if not got and item.get('pmid'):
                 try:
-                    txt, u = fetch_europepmc_abstract(item.get("pmid", ""), epmc)
+                    txt, _ = fetch_europepmc_abstract(item.get('pmid', ''), epmc)
                     if save_abstract(abs_path, txt):
                         got = True
                         abs_ok += 1
-                        manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "europepmc", "url": u})
                 except Exception as exc:
-                    error_rows.append({"paper_id": pid, "step": "europepmc_abstract", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
-            if not got and item.get("doi") and secrets.get("CROSSREF_MAILTO"):
+                    error_rows.append({'paper_id': pid, 'step': 'europepmc_abstract', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+            if not got and item.get('doi') and secrets.get('CROSSREF_MAILTO'):
                 try:
-                    txt, u = fetch_crossref_abstract(item["doi"], cr, secrets["CROSSREF_MAILTO"])
+                    txt, _ = fetch_crossref_abstract(item['doi'], cr, secrets['CROSSREF_MAILTO'])
                     if save_abstract(abs_path, txt):
                         got = True
                         abs_ok += 1
-                        manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "ok", "source": "crossref", "url": u})
                 except Exception as exc:
-                    error_rows.append({"paper_id": pid, "step": "crossref_abstract", "url": "", "http_code": "", "message": str(exc), "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
+                    error_rows.append({'paper_id': pid, 'step': 'crossref_abstract', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
             if not got:
-                reason_counter["NO_ABSTRACT"] += 1
-                manifest_rows.append({"paper_id": pid, "step": "abstract", "status": "NO_ABSTRACT", "source": "none", "url": ""})
-                logger.info(f"[abs {i}/{len(selected_abs)}] {pid}: NO_ABSTRACT")
+                reason_counter['NO_ABSTRACT'] += 1
+                manifest_rows.append({'paper_id': pid, 'step': 'abstract', 'status': 'NO_ABSTRACT', 'source': 'none', 'url': ''})
             else:
-                logger.info(f"[abs {i}/{len(selected_abs)}] {pid}: OK")
+                manifest_rows.append({'paper_id': pid, 'step': 'abstract', 'status': 'ok', 'source': 'multi', 'url': ''})
 
-        manual_queue_path = papers_dir / "pdf_manual_queue.csv"
-        existing_manual = list(csv.DictReader(manual_queue_path.open("r", encoding="utf-8-sig", newline=""))) if manual_queue_path.exists() else []
-        manual_map = {r.get("paper_id", ""): r for r in existing_manual}
+        manual_queue_path = papers_dir / 'pdf_manual_queue.csv'
+        existing_manual = list(csv.DictReader(manual_queue_path.open('r', encoding='utf-8-sig', newline=''))) if manual_queue_path.exists() else []
+        manual_map = {r.get('paper_id', ''): r for r in existing_manual}
         for pid, q in list(manual_map.items()):
-            if (q.get("status") or "") == "MISSING" and normalize_text(q.get("manual_pdf_local_path", "")):
-                src = Path(q["manual_pdf_local_path"])
+            if (q.get('status') or '') == 'MISSING' and normalize_text(q.get('manual_pdf_local_path', '')):
+                src = Path(q['manual_pdf_local_path'])
                 if src.exists():
-                    dst = pdf_dir / f"{pid}.pdf"
+                    dst = pdf_dir / f'{pid}.pdf'
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(src, dst)
-                    q["status"] = "FOUND_MANUAL"
+                    q['status'] = 'FOUND_MANUAL'
 
-        logger.info("[6/6] Harvest PDFs + итоги")
+        pdf_ok = 0
+        logger.info('[6/6] Качаю PDF')
         for i, item in enumerate(selected_pdf, start=1):
-            pid = item["paper_id"]
-            pdf_path = pdf_dir / f"{pid}.pdf"
+            pid = item['paper_id']
+            pdf_path = pdf_dir / f'{pid}.pdf'
             if pdf_path.exists() and not args.force:
                 ok, _ = ensure_pdf_valid(pdf_path)
                 if ok:
                     pdf_ok += 1
-                    logger.info(f"[pdf {i}/{len(selected_pdf)}] {pid}: OK")
+                    logger.info(f'[pdf {i}/{len(selected_pdf)}] {pid}: RESUME_OK')
                     continue
-            urls = sort_pdf_candidates(list(item.get("oa_pdf_candidates", [])))
-            tried = []
-            got_pdf = False
+            urls = sort_pdf_candidates(list(item.get('oa_pdf_candidates', [])))
+            tried, got_pdf = [], False
             for u in urls:
                 tried.append(u)
                 ok, msg, code, ctype = download_pdf(u, pdf_path, args.timeout)
-                manifest_rows.append({"paper_id": pid, "step": "download_pdf", "status": "ok" if ok else "failed", "source": classify_pdf_url(u), "url": u, "http_code": code, "content_type": ctype})
+                manifest_rows.append({'paper_id': pid, 'step': 'download_pdf', 'status': 'ok' if ok else 'failed', 'source': classify_pdf_url(u), 'url': u, 'http_code': code, 'content_type': ctype})
                 if ok:
                     got_pdf = True
                     pdf_ok += 1
-                    logger.info(f"[pdf {i}/{len(selected_pdf)}] {pid}: OK")
                     break
-                err_code = f"ERROR_{code}" if code in (401, 403) else "NO_OA_PDF"
-                error_rows.append({"paper_id": pid, "step": "download_pdf", "url": u, "http_code": code, "message": msg, "doi": item.get("doi", ""), "openalex_id": item.get("openalex_id", "")})
-                logger.info(f"[pdf {i}/{len(selected_pdf)}] {pid}: {err_code}")
+                error_rows.append({'paper_id': pid, 'step': 'download_pdf', 'url': u, 'http_code': code, 'message': msg, 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
             if not got_pdf:
-                reason_counter["NO_OA_PDF"] += 1
+                reason_counter['NO_OA_PDF'] += 1
                 manual_map[pid] = {
-                    "cite_short": build_cite_short(item.get("first_author", ""), item.get("year", ""), item.get("title", "")),
-                    "paper_id": pid,
-                    "doi": item.get("doi", ""),
-                    "title": item.get("title", ""),
-                    "year": item.get("year", ""),
-                    "first_author": item.get("first_author", ""),
-                    "best_oa_urls_tried": " | ".join(tried[:3]),
-                    "manual_pdf_local_path": manual_map.get(pid, {}).get("manual_pdf_local_path", ""),
-                    "status": "MISSING",
-                    "notes": "403 publisher" if any("403" in str(e.get("http_code", "")) for e in error_rows if e.get("paper_id") == pid) else "no_oa_location",
+                    'cite_short': build_cite_short(item.get('first_author', ''), item.get('year', ''), item.get('title', '')),
+                    'paper_id': pid,
+                    'doi': item.get('doi', ''),
+                    'title': item.get('title', ''),
+                    'year': item.get('year', ''),
+                    'first_author': item.get('first_author', ''),
+                    'tried_urls': ' | '.join(tried[:3]),
+                    'manual_pdf_local_path': manual_map.get(pid, {}).get('manual_pdf_local_path', ''),
+                    'status': 'MISSING',
+                    'notes': '403 publisher' if any(str(e.get('http_code','')) in ('401', '403') for e in error_rows if e.get('paper_id') == pid) else 'no_oa_location',
                 }
+            elif pid in manual_map:
+                manual_map[pid]['status'] = 'DOWNLOADED_OK'
 
-        write_csv(manual_queue_path, list(manual_map.values()), ["cite_short", "paper_id", "doi", "title", "year", "first_author", "best_oa_urls_tried", "manual_pdf_local_path", "status", "notes"])
-        (papers_dir / "pdf_manual_instructions.md").write_text(
-            "# Ручная очередь PDF\n\n1. Скачайте PDF вручную в любое место.\n2. Заполните столбец `manual_pdf_local_path` в `pdf_manual_queue.csv`.\n3. Запустите RUN_C1 снова — файл будет автоматически скопирован в in/papers/pdfs/<paper_id>.pdf и статус станет FOUND_MANUAL.\n",
-            encoding="utf-8",
+        write_csv(manual_queue_path, list(manual_map.values()), ['cite_short', 'paper_id', 'doi', 'title', 'year', 'first_author', 'tried_urls', 'manual_pdf_local_path', 'status', 'notes'])
+        write_jsonl(manifests_dir / 'manifest.jsonl', manifest_rows)
+        write_csv(manifests_dir / 'errors.csv', error_rows, ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'])
+
+        status = 'OK' if not error_rows else 'DEGRADED'
+        top_txt = '\n'.join([f'- {k}: {v}' for k, v in reason_counter.most_common(5)]) if reason_counter else '- нет'
+        (out_dir / 'harvest_report.md').write_text(
+            f"# Stage C1 — Harvest report\n\nСтатус: **{status}**\n\n- selected abstracts: {len(selected_abs)}\n- selected pdfs: {len(selected_pdf)}\n- downloaded abstracts_ok: {abs_ok}\n- downloaded pdfs_ok: {pdf_ok}\n- errors total: {len(error_rows)}\n\n## Top-5 причин\n{top_txt}\n",
+            encoding='utf-8',
         )
-
-        write_jsonl(manifests_dir / "manifest.jsonl", manifest_rows)
-        write_csv(manifests_dir / "errors.csv", error_rows, ["paper_id", "step", "url", "http_code", "message", "doi", "openalex_id"])
-
-        status = "OK" if not error_rows else "DEGRADED"
-        top5 = reason_counter.most_common(5)
-        top_txt = "\n".join([f"- {k}: {v}" for k, v in top5]) if top5 else "- нет"
-
-        report = (
-            "# Stage C1 — Harvest report\n\n"
-            f"Статус: **{status}**\n\n"
-            f"- corpus: {stats['corpus_n']}\n"
-            f"- after dedup: {stats['after_dedup_n']}\n"
-            f"- after domain filter: {stats['after_domain_filter_n']}\n"
-            f"- candidates sent to ChatGPT: {len(candidates)}\n"
-            f"- selected abstracts: {len(selected_abs)}\n"
-            f"- selected pdfs: {len(selected_pdf)}\n"
-            f"- downloaded abstracts_ok: {abs_ok}\n"
-            f"- downloaded pdfs_ok: {pdf_ok}\n"
-            f"- errors total: {len(error_rows)}\n\n"
-            "## Top-5 причин ошибок\n"
-            f"{top_txt}\n"
+        (out_dir / 'prisma_c1.md').write_text(
+            f"# PRISMA C1\n\n- status: {status}\n- corpus: {stats.get('corpus_n',0)}\n- after_dedup: {stats.get('after_dedup_n',0)}\n- after_domain_filter: {stats.get('after_domain_filter_n',0)}\n- selected_for_abstract: {len(selected_abs)}\n- selected_for_pdf: {len(selected_pdf)}\n- downloaded_abstract_ok: {abs_ok}\n- downloaded_pdf_ok: {pdf_ok}\n- errors_total: {len(error_rows)}\n",
+            encoding='utf-8',
         )
-        (out_dir / "harvest_report.md").write_text(report, encoding="utf-8")
-
-        prisma = (
-            "# PRISMA C1\n\n"
-            f"- status: {status}\n"
-            f"- corpus: {stats['corpus_n']}\n"
-            f"- after_dedup: {stats['after_dedup_n']}\n"
-            f"- after_domain_filter: {stats['after_domain_filter_n']}\n"
-            f"- selected_for_abstract: {len(selected_abs)}\n"
-            f"- selected_for_pdf: {len(selected_pdf)}\n"
-            f"- downloaded_abstract_ok: {abs_ok}\n"
-            f"- downloaded_pdf_ok: {pdf_ok}\n"
-            f"- errors_total: {len(error_rows)}\n"
-        )
-        (out_dir / "prisma_c1.md").write_text(prisma, encoding="utf-8")
-
-        summary = (
-            "\nИТОГ Stage C1\n"
-            f"- selected abstracts N: {len(selected_abs)}\n"
-            f"- selected pdfs N: {len(selected_pdf)}\n"
-            f"- downloaded abstracts_ok: {abs_ok}\n"
-            f"- downloaded pdfs_ok: {pdf_ok}\n"
-            f"- top-5 error reasons:\n{top_txt}\n"
-            f"- errors.csv: {manifests_dir / 'errors.csv'}\n"
-            f"- LAST.log: {last_log}\n"
-            f"- статус: {status}\n"
-        )
-        print(summary)
-
-        (root / "launcher_logs").mkdir(exist_ok=True)
-        (root / "launcher_logs" / "LAST_LOG.txt").write_text(f"Stage C1\nIDEA={idea_dir}\nLOG={last_log}\nERRORS={manifests_dir / 'errors.csv'}\n", encoding="utf-8")
-        shutil.copyfile(run_log, last_log)
-        logger.info(f"Stage C1 завершен. Статус={status}")
+        print(f"ИТОГ: abstracts_ok={abs_ok} pdf_ok={pdf_ok} missing_pdf={max(0, len(selected_pdf)-pdf_ok)}\nerrors.csv={manifests_dir / 'errors.csv'}\nlog={last_log}")
         return 0
 
     except Exception as exc:
-        logger.err(f"Критическая ошибка Stage C1: {exc}")
-        manifests_dir.mkdir(parents=True, exist_ok=True)
-        if not (manifests_dir / "errors.csv").exists():
-            write_csv(manifests_dir / "errors.csv", [{"paper_id": "", "step": "fatal", "url": "", "http_code": "", "message": str(exc), "doi": "", "openalex_id": ""}], ["paper_id", "step", "url", "http_code", "message", "doi", "openalex_id"])
+        logger.err(f'Критическая ошибка Stage C1: {exc}')
+        if not (manifests_dir / 'errors.csv').exists():
+            write_csv(manifests_dir / 'errors.csv', [{'paper_id': '', 'step': 'fatal', 'url': '', 'http_code': '', 'message': str(exc), 'doi': '', 'openalex_id': ''}], ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'])
         return 1
     finally:
         try:
@@ -1000,5 +986,5 @@ def main() -> int:
         logger.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     raise SystemExit(main())
