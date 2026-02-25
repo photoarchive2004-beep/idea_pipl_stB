@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -814,7 +814,7 @@ def main() -> int:
                 print(f"\nОтвет не прошёл валидацию. Копия сохранена: {invalid_path}\n{msg}\n")
                 return 1
 
-        write_csv(papers_dir / "selection.csv", selected, ["paper_id", "title", "year", "doi", "openalex_id", "first_author", "downloadability_hint", "select_for_abstract", "select_for_pdf", "reason", "domain", "field", "subfield"])
+        write_csv(papers_dir / "selection.csv", selected, ["paper_id", "title", "year", "doi", "openalex_id", "first_author", "tier", "downloadability_hint", "select_for_abstract", "select_for_pdf", "reason", "domain", "field", "subfield"])
         write_jsonl(papers_dir / "papers.jsonl", selected)
 
         selected_abs = [x for x in selected if x["select_for_abstract"] == 1]
