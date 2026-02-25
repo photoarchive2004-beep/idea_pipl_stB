@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -55,7 +56,7 @@ class ApiClient:
     def __init__(self, name: str, rps: float, timeout: int, logger: RunLogger):
         self.name = name
         self.rps = rps
-        self.timeout = timeout
+        self.timeout = (10, max(10, int(timeout)))
         self.logger = logger
         self.next_allowed = 0.0
         self.session = requests.Session()
@@ -673,7 +674,7 @@ def ensure_pdf_valid(path: Path, min_size: int = 30 * 1024) -> Tuple[bool, str]:
 
 def download_pdf(url: str, path: Path, timeout: int) -> Tuple[bool, str, int, str]:
     try:
-        with requests.get(url, timeout=max(timeout, 30), stream=True, allow_redirects=True) as r:
+        with requests.get(url, timeout=(10, max(timeout, 30)), stream=True, allow_redirects=True) as r:
             code = r.status_code
             ctype = (r.headers.get("Content-Type", "") or "").lower()
             if code >= 400:
@@ -761,9 +762,19 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
-    idea_dir = find_idea_dir(root, args.idea_dir or None)
-    logs_dir, in_dir, papers_dir, manifests_dir = idea_dir / 'logs', idea_dir / 'in', idea_dir / 'in' / 'papers', idea_dir / 'in' / 'papers' / 'manifests'
-    out_dir, abstracts_dir, pdf_dir = idea_dir / 'out', idea_dir / 'in' / 'papers' / 'abstracts', idea_dir / 'in' / 'papers' / 'pdfs'
+    idea_dir: Optional[Path] = None
+    early_resolve_error: Optional[Exception] = None
+    try:
+        idea_dir = find_idea_dir(root, args.idea_dir or None)
+    except Exception as exc:
+        early_resolve_error = exc
+    logs_dir = (idea_dir / 'logs') if idea_dir else (root / 'logs')
+    in_dir = (idea_dir / 'in') if idea_dir else (root / 'in')
+    papers_dir = in_dir / 'papers'
+    manifests_dir = papers_dir / 'manifests'
+    out_dir = (idea_dir / 'out') if idea_dir else (root / 'out')
+    abstracts_dir = papers_dir / 'abstracts'
+    pdf_dir = papers_dir / 'pdfs'
     c1_chat_dir = in_dir / 'c1_chatgpt'
     prompt_path, resp_path = c1_chat_dir / 'PROMPT.txt', c1_chat_dir / 'RESPONSE.json'
     candidates_path = papers_dir / 'candidates.json'
@@ -778,6 +789,8 @@ def main() -> int:
     error_rows: List[Dict[str, Any]] = []
 
     try:
+        if early_resolve_error is not None or idea_dir is None:
+            raise RuntimeError(f'Не удалось определить IDEA_DIR: {early_resolve_error}')
         logger.info('=== Stage C1 ===')
         logger.info(f'IDEA_DIR={idea_dir}')
         if args.repair_manual_pdfs:
@@ -841,7 +854,7 @@ def main() -> int:
                     print('PROMPT скопирован в буфер обмена.')
                 return 2
 
-        logger.info('[4/6] HARVEST: использую готовые candidates + RESPONSE')
+        logger.info('[4/6] HARVEST mode, skip PREPARE: использую готовые candidates + RESPONSE')
         candidates = load_json_if_exists(candidates_path, [])
         if not candidates:
             raise RuntimeError('Не найден candidates.json для HARVEST. Сначала выполните PREPARE.')
@@ -975,6 +988,8 @@ def main() -> int:
 
     except Exception as exc:
         logger.err(f'Критическая ошибка Stage C1: {exc}')
+        logger.err(traceback.format_exc())
+        print(f'ОШИБКА: {exc}. Подробности: {last_log}')
         if not (manifests_dir / 'errors.csv').exists():
             write_csv(manifests_dir / 'errors.csv', [{'paper_id': '', 'step': 'fatal', 'url': '', 'http_code': '', 'message': str(exc), 'doi': '', 'openalex_id': ''}], ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'])
         return 1
