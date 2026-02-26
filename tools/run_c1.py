@@ -9,7 +9,6 @@ import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -53,7 +52,7 @@ class RunLogger:
 
 
 class ApiClient:
-    def __init__(self, name: str, rps: float, timeout: Tuple[int, int], logger: RunLogger):
+    def __init__(self, name: str, rps: float, timeout: int, logger: RunLogger):
         self.name = name
         self.rps = rps
         self.timeout = timeout
@@ -426,8 +425,13 @@ def _short_structured_idea(structured: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def generate_light_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
+    """Build a SHORT prompt for ChatGPT to return FILTER RULES (not a list of paper_ids).
+
+    Key goal: force VALID JSON (no markdown, no extra quotes like ""GEA Group"", no trailing commas).
+    """
     domain_counter = Counter(normalize_text(c.get("domain", "")).lower() for c in candidates if normalize_text(c.get("domain", "")))
     field_counter = Counter(normalize_text(c.get("field", "")).lower() for c in candidates if normalize_text(c.get("field", "")))
+
     payload = {
         "idea_text": normalize_text(idea_text)[:4000],
         "structured_idea_short": _short_structured_idea(structured),
@@ -437,26 +441,35 @@ def generate_light_screening_prompt(idea_text: str, structured: Dict[str, Any], 
             "top_fields": field_counter.most_common(10),
         },
         "required_response_contract": {
-            "include_keywords": ["..."],
-            "exclude_keywords": ["..."],
-            "allowed_domains": ["..."] ,
-            "blocked_domains": ["..."],
+            "include_keywords": ["<5-20 ключевых фраз>"],
+            "exclude_keywords": ["<5-30 исключающих фраз (омонимы/чужие домены)>"],
+            "allowed_domains": [],
+            "blocked_domains": [],
             "target_abstracts": max_abs,
             "target_pdfs": max_pdf,
-            "notes": "optional"
+            "notes": ""
         },
         "rules": [
-            "Верни только JSON-объект без markdown.",
-            "Не возвращай paper_id и списки статей: только правила фильтрации.",
-            "include_keywords: 5-20, exclude_keywords: 5-30.",
-            f"target_abstracts <= {max_abs}, target_pdfs <= {max_pdf}, target_pdfs <= target_abstracts.",
-            "Учитывай неоднозначные аббревиатуры и добавляй исключающие keywords/domain для нерелевантных значений.",
+            "⚠️ ВЕРНИ ТОЛЬКО ВАЛИДНЫЙ JSON. Никакого Markdown, никаких ```.",
+            "Ответ должен начинаться с { и заканчиваться }. Нельзя добавлять текст до/после JSON.",
+            "Используй только обычные двойные кавычки \"\", не «», не “”.",
+            "НЕ ДОБАВЛЯЙ лишние кавычки внутри строк. ПРАВИЛЬНО: \"GEA Group\". ПЛОХО: \"\"GEA Group\"\".",
+            "НЕ ставь запятую после последнего элемента в списке/объекте (no trailing commas).",
+            "Заполни include_keywords (5–20) и exclude_keywords (5–30). Не оставляй '<...>' и не ставь точки/заглушки.",
+            f"target_abstracts ≤ {max_abs}, target_pdfs ≤ {max_pdf}, и target_pdfs ≤ target_abstracts.",
+            "allowed_domains/blocked_domains могут быть пустыми []. Если не уверен — оставь [].",
+            "Не возвращай paper_id и не перечисляй статьи: только правила фильтрации (keywords/domains/targets).",
+            "Учти неоднозначные аббревиатуры: трактуй их по контексту идеи, чужие значения добавляй в exclude_keywords/blocked_domains.",
         ],
     }
-    return "LIGHT screening для C1: сформируй фильтры для автоматического отбора.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
+    return "LIGHT screening C1: сформируй ФИЛЬТРЫ для автоматического отбора. Верни строго JSON по контракту.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
 def generate_full_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
+    """Build a prompt for ChatGPT to choose конкретные paper_id.
+
+    Key goal: force VALID JSON (no markdown, no extra quotes, no trailing commas).
+    """
     reduced_candidates = [{
         "paper_id": c["paper_id"],
         "title": c["title"],
@@ -469,19 +482,30 @@ def generate_full_screening_prompt(idea_text: str, structured: Dict[str, Any], c
         "field": c.get("field", ""),
         "subfield": c.get("subfield", ""),
     } for c in candidates]
+
     payload = {
         "idea_text": idea_text,
         "structured_idea": structured,
         "max_abstracts": max_abs,
         "max_pdfs": max_pdf,
         "strict_response_contract": {
-            "selected": [{"paper_id": "<id из candidates>", "select_for_abstract": 1, "select_for_pdf": 0, "tier": "core|support|background", "reason": "коротко"}],
-            "notes": "optional"
+            "selected": [
+                {"paper_id": "<id из candidates>", "select_for_abstract": 1, "select_for_pdf": 0, "tier": "core|support|background", "reason": "коротко"}
+            ],
+            "notes": ""
         },
+        "rules": [
+            "⚠️ ВЕРНИ ТОЛЬКО ВАЛИДНЫЙ JSON. Никакого Markdown, никаких ```.",
+            "Ответ должен начинаться с { и заканчиваться }. Нельзя добавлять текст до/после JSON.",
+            "Используй только обычные двойные кавычки \"\", не «», не “”.",
+            "НЕ ДОБАВЛЯЙ лишние кавычки внутри строк. ПРАВИЛЬНО: \"GEA Group\". ПЛОХО: \"\"GEA Group\"\".",
+            "НЕ ставь запятую после последнего элемента в списке/объекте (no trailing commas).",
+            "paper_id должен быть ТОЛЬКО из candidates. Не придумывай новые.",
+            f"Не превышай max_abstracts={max_abs} и max_pdfs={max_pdf}. select_for_pdf=1 только если select_for_abstract=1.",
+        ],
         "candidates": reduced_candidates,
     }
-    return "FULL screening C1: верни JSON по контракту с selected[].\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
-
+    return "FULL screening C1: выбери статьи и верни JSON по контракту selected[].\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
 def parse_screening_response(path: Path) -> Dict[str, Any]:
     raw = path.read_text(encoding="utf-8", errors="replace")
@@ -634,9 +658,9 @@ def fetch_semantic_scholar_pdf_url(doi: str, title: str, s2: ApiClient, api_key:
     return "", u
 
 
-def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str, base_url: str = UNPAYWALL_BASE) -> Tuple[List[str], str]:
-    u = f"{base_url}/{requests.utils.quote(doi, safe='')}?email={requests.utils.quote(email)}"
-    j = up.get_json(u, retries=2)
+def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str) -> Tuple[List[str], str]:
+    u = f"{UNPAYWALL_BASE}/{requests.utils.quote(doi, safe='')}?email={requests.utils.quote(email)}"
+    j = up.get_json(u)
     urls: List[str] = []
     best = (j.get("best_oa_location") or {}).get("url_for_pdf")
     if best:
@@ -651,84 +675,6 @@ def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str, base_url: str 
             seen.add(x)
             uniq.append(x)
     return uniq, u
-
-
-def fetch_openalex_pdf_urls(row: Dict[str, Any], oa: ApiClient, secrets: Dict[str, str]) -> Tuple[List[str], str]:
-    work, url = get_openalex_work(row, oa, secrets)
-    urls: List[str] = []
-    open_access = work.get("open_access") or {}
-    if open_access.get("is_oa"):
-        oa_url = normalize_text(open_access.get("oa_url", ""))
-        if oa_url:
-            urls.append(oa_url)
-    primary_location = work.get("primary_location") or {}
-    pdf_url = normalize_text(primary_location.get("pdf_url", ""))
-    if pdf_url:
-        urls.append(pdf_url)
-    best_oa = work.get("best_oa_location") or {}
-    best_pdf = normalize_text(best_oa.get("pdf_url", ""))
-    if best_pdf:
-        urls.append(best_pdf)
-    uniq, seen = [], set()
-    for x in urls:
-        if x and x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return uniq, url
-
-
-def fetch_crossref_pdf_urls(doi: str, cr: ApiClient, mailto: str) -> Tuple[List[str], str]:
-    h = {"User-Agent": f"IDEA_PIPELINE_C1/1.0 (mailto:{mailto})"}
-    u = f"{CROSSREF_BASE}/{requests.utils.quote(doi, safe='')}?mailto={requests.utils.quote(mailto)}"
-    j = cr.get_json(u, headers=h, retries=2)
-    urls: List[str] = []
-    for link in (j.get("message") or {}).get("link") or []:
-        x = normalize_text(link.get("URL", ""))
-        if x:
-            urls.append(x)
-    uniq, seen = [], set()
-    for x in urls:
-        if x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return uniq, u
-
-
-def is_unpaywall_connectivity_error(exc: Exception) -> bool:
-    text = str(exc).lower()
-    tokens = [
-        "nameresolutionerror",
-        "remote disconnected",
-        "remotedisconnected",
-        "failed to establish a new connection",
-        "temporary failure in name resolution",
-        "errno 11001",
-        "dns",
-        "read timed out",
-        "readtimeout",
-        "connectionerror",
-        "max retries exceeded",
-        "timed out",
-        "connection aborted",
-        "getaddrinfo failed",
-        "socket.gaierror",
-    ]
-    if any(t in text for t in tokens):
-        return True
-    return isinstance(exc, (requests.ConnectionError, requests.Timeout, socket.gaierror, ConnectionError))
-
-
-def check_unpaywall_health(up: ApiClient, email: str, logger: RunLogger, base_url: str) -> Tuple[bool, str]:
-    test_doi = "10.1038/nature12373"
-    try:
-        fetch_unpaywall_pdf_urls(test_doi, up, email, base_url)
-        return True, ""
-    except Exception as exc:
-        if is_unpaywall_connectivity_error(exc) or "http 5" in str(exc).lower():
-            logger.warn(f"Unpaywall health-check не пройден: {exc}")
-            return False, str(exc)
-        logger.warn(f"Unpaywall health-check: неожиданный ответ, продолжаю с включенным Unpaywall: {exc}")
-        return True, ""
 
 
 def classify_pdf_url(url: str) -> str:
@@ -815,11 +761,9 @@ def ensure_pdf_valid(path: Path, min_size: int = 30 * 1024) -> Tuple[bool, str]:
     return True, "OK"
 
 
-def download_pdf(url: str, path: Path, timeout: Tuple[int, int]) -> Tuple[bool, str, int, str]:
+def download_pdf(url: str, path: Path, timeout: int) -> Tuple[bool, str, int, str]:
     try:
-        connect_timeout = timeout[0]
-        read_timeout = max(timeout[1], 30)
-        with requests.get(url, timeout=(connect_timeout, read_timeout), stream=True, allow_redirects=True) as r:
+        with requests.get(url, timeout=max(timeout, 30), stream=True, allow_redirects=True) as r:
             code = r.status_code
             ctype = (r.headers.get("Content-Type", "") or "").lower()
             if code >= 400:
@@ -978,13 +922,9 @@ def main() -> int:
     ap.add_argument('--max-candidates', type=int, default=400)
     ap.add_argument('--max-abstracts', type=int, default=120)
     ap.add_argument('--max-pdfs', type=int, default=40)
-    ap.add_argument('--timeout', type=int, default=0)
-    ap.add_argument('--timeout-connect', type=int, default=5)
-    ap.add_argument('--timeout-read', type=int, default=20)
+    ap.add_argument('--timeout', type=int, default=40)
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--repair-manual-pdfs', action='store_true')
-    ap.add_argument('--disable-unpaywall', action='store_true')
-    ap.add_argument('--unpaywall-base', default=UNPAYWALL_BASE)
     ap.add_argument('--rps-openalex', type=float, default=2.0)
     ap.add_argument('--rps-unpaywall', type=float, default=1.5)
     ap.add_argument('--rps-crossref', type=float, default=1.0)
@@ -993,7 +933,6 @@ def main() -> int:
     args = ap.parse_args()
 
     root = Path(__file__).resolve().parent.parent
-    unpaywall_base = normalize_text(args.unpaywall_base) or UNPAYWALL_BASE
     idea_dir = find_idea_dir(root, args.idea_dir or None)
     logs_dir, in_dir, papers_dir, manifests_dir = idea_dir / 'logs', idea_dir / 'in', idea_dir / 'in' / 'papers', idea_dir / 'in' / 'papers' / 'manifests'
     out_dir, abstracts_dir, pdf_dir = idea_dir / 'out', idea_dir / 'in' / 'papers' / 'abstracts', idea_dir / 'in' / 'papers' / 'pdfs'
@@ -1025,38 +964,11 @@ def main() -> int:
 
         harvest_mode = False
         secrets = load_secrets(root)
-        if args.timeout and args.timeout > 0:
-            req_timeout = (min(args.timeout, 10), args.timeout)
-        else:
-            req_timeout = (args.timeout_connect, args.timeout_read)
-        oa = ApiClient('OpenAlex', args.rps_openalex, req_timeout, logger)
-        up = ApiClient('Unpaywall', args.rps_unpaywall, (5, 10), logger)
-        cr = ApiClient('Crossref', args.rps_crossref, req_timeout, logger)
-        epmc = ApiClient('EuropePMC', args.rps_europepmc, req_timeout, logger)
-        s2 = ApiClient('SemanticScholar', args.rps_s2, req_timeout, logger)
-        report_notes: List[str] = []
-        unpaywall_enabled = not args.disable_unpaywall
-        unpaywall_warned = False
-
-        if args.disable_unpaywall:
-            msg = 'Unpaywall недоступен/отключён → PDF будем искать без него (OpenAlex/Crossref/EuropePMC).'
-            logger.warn(msg)
-            report_notes.append('- Unpaywall отключён вручную через --disable-unpaywall.')
-            unpaywall_warned = True
-        elif not secrets.get('UNPAYWALL_EMAIL'):
-            unpaywall_enabled = False
-            msg = 'Unpaywall недоступен/отключён → PDF будем искать без него (OpenAlex/Crossref/EuropePMC).'
-            logger.warn(msg)
-            report_notes.append('- Unpaywall отключён: не задан UNPAYWALL_EMAIL в config/secrets.env.')
-            unpaywall_warned = True
-        else:
-            ok, reason = check_unpaywall_health(up, secrets['UNPAYWALL_EMAIL'], logger, unpaywall_base)
-            if not ok:
-                unpaywall_enabled = False
-                msg = 'Unpaywall недоступен (DNS/timeout). Продолжаю без Unpaywall. PDF-скачивание будет ограничено.'
-                logger.warn(msg)
-                report_notes.append(f'- {msg} Причина: {reason}')
-                unpaywall_warned = True
+        oa = ApiClient('OpenAlex', args.rps_openalex, args.timeout, logger)
+        up = ApiClient('Unpaywall', args.rps_unpaywall, args.timeout, logger)
+        cr = ApiClient('Crossref', args.rps_crossref, args.timeout, logger)
+        epmc = ApiClient('EuropePMC', args.rps_europepmc, args.timeout, logger)
+        s2 = ApiClient('SemanticScholar', args.rps_s2, args.timeout, logger)
 
         if not harvest_mode:
             corpus_path = out_dir / 'corpus.csv'
@@ -1114,40 +1026,14 @@ def main() -> int:
         selected_abs = [x for x in selected if int(x.get('select_for_abstract', 0)) == 1]
         selected_pdf = [x for x in selected if int(x.get('select_for_pdf', 0)) == 1]
         logger.info(f'[3/6] Обогащение OA-линками (best-effort) для топ PDF-кандидатов: {min(len(selected_pdf), 80)}')
-        if not unpaywall_enabled and not unpaywall_warned:
-            msg = 'Unpaywall недоступен/отключён → PDF будем искать без него (OpenAlex/Crossref/EuropePMC).'
-            logger.warn(msg)
-            report_notes.append(f'- {msg}')
-            unpaywall_warned = True
         for item in selected_pdf[:80]:
             urls = list(item.get('oa_pdf_candidates', []))
-            try:
-                xs, _ = fetch_openalex_pdf_urls(item, oa, secrets)
-                urls.extend(xs)
-            except Exception as exc:
-                error_rows.append({'paper_id': item['paper_id'], 'step': 'openalex_pdf_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
-
-            if unpaywall_enabled and item.get('doi') and secrets.get('UNPAYWALL_EMAIL'):
+            if item.get('doi') and secrets.get('UNPAYWALL_EMAIL'):
                 try:
-                    xs, _ = fetch_unpaywall_pdf_urls(item['doi'], up, secrets['UNPAYWALL_EMAIL'], unpaywall_base)
+                    xs, _ = fetch_unpaywall_pdf_urls(item['doi'], up, secrets['UNPAYWALL_EMAIL'])
                     urls.extend(xs)
                 except Exception as exc:
-                    if is_unpaywall_connectivity_error(exc):
-                        unpaywall_enabled = False
-                        msg = 'Unpaywall недоступен (DNS/timeout). Продолжаю без Unpaywall. PDF-скачивание будет ограничено.'
-                        if not unpaywall_warned:
-                            logger.warn(msg)
-                            report_notes.append(f'- {msg} Причина: {exc}')
-                            unpaywall_warned = True
-                    else:
-                        error_rows.append({'paper_id': item['paper_id'], 'step': 'unpaywall_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
-
-            if item.get('doi') and secrets.get('CROSSREF_MAILTO'):
-                try:
-                    xs, _ = fetch_crossref_pdf_urls(item['doi'], cr, secrets['CROSSREF_MAILTO'])
-                    urls.extend(xs)
-                except Exception as exc:
-                    error_rows.append({'paper_id': item['paper_id'], 'step': 'crossref_pdf_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+                    error_rows.append({'paper_id': item['paper_id'], 'step': 'unpaywall_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
             if item.get('pmid'):
                 try:
                     xs, _ = fetch_europepmc_pdf_urls(item['pmid'], epmc)
@@ -1235,7 +1121,7 @@ def main() -> int:
             tried, got_pdf = [], False
             for u in urls:
                 tried.append(u)
-                ok, msg, code, ctype = download_pdf(u, pdf_path, req_timeout)
+                ok, msg, code, ctype = download_pdf(u, pdf_path, args.timeout)
                 manifest_rows.append({'paper_id': pid, 'step': 'download_pdf', 'status': 'ok' if ok else 'failed', 'source': classify_pdf_url(u), 'url': u, 'http_code': code, 'content_type': ctype})
                 if ok:
                     got_pdf = True
@@ -1263,12 +1149,10 @@ def main() -> int:
         write_jsonl(manifests_dir / 'manifest.jsonl', manifest_rows)
         write_csv(manifests_dir / 'errors.csv', error_rows, ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'])
 
-        status = 'OK' if (not error_rows and unpaywall_enabled) else 'DEGRADED'
+        status = 'OK' if not error_rows else 'DEGRADED'
         top_txt = '\n'.join([f'- {k}: {v}' for k, v in reason_counter.most_common(5)]) if reason_counter else '- нет'
-        notes_block = "\n".join(report_notes) if report_notes else "- нет"
-        unpaywall_status = 'OFF (недоступен/отключён)' if not unpaywall_enabled else 'ON'
         (out_dir / 'harvest_report.md').write_text(
-            f"# Stage C1 — Harvest report\n\nСтатус: **{status}**\n\n- selected abstracts: {len(selected_abs)}\n- selected pdfs: {len(selected_pdf)}\n- downloaded abstracts_ok: {abs_ok}\n- downloaded pdfs_ok: {pdf_ok}\n- errors total: {len(error_rows)}\n- Unpaywall: {unpaywall_status}\n\n## Top-5 причин\n{top_txt}\n\n## Предупреждения и деградация\n{notes_block}\n",
+            f"# Stage C1 — Harvest report\n\nСтатус: **{status}**\n\n- selected abstracts: {len(selected_abs)}\n- selected pdfs: {len(selected_pdf)}\n- downloaded abstracts_ok: {abs_ok}\n- downloaded pdfs_ok: {pdf_ok}\n- errors total: {len(error_rows)}\n\n## Top-5 причин\n{top_txt}\n",
             encoding='utf-8',
         )
         (out_dir / 'prisma_c1.md').write_text(
@@ -1281,7 +1165,6 @@ def main() -> int:
             f"- candidates: {stats.get('after_domain_filter_n', len(candidates))}",
             f"- selected_for_abstract: {len(selected_abs)} + abstracts_ok={abs_ok}",
             f"- selected_for_pdf: {len(selected_pdf)} + pdf_ok={pdf_ok}",
-            f"- Unpaywall: {unpaywall_status}",
             f"- selection.csv: {papers_dir / 'selection.csv'}",
         ]
         errors_path = manifests_dir / 'errors.csv'
