@@ -14,7 +14,7 @@
 3) Прогон по стадиям (обычно так):
    - **RUN_A.bat**  → структурирует идею (через ChatGPT, 2 запуска)
    - **RUN_B.bat**  → собирает корпус литературы (OpenAlex)
-   - **RUN_C.bat**  → evidence-таблица (обычно через ChatGPT, 2 запуска)
+   - **RUN_C3.bat** (или **RUN_C.bat**) → evidence-таблица + bundle для Stage D (через ChatGPT, 2 запуска)
    - **RUN_D.bat**  → карта пробелов/противоречий
    - **RUN_E.bat**  → «новизна/прорывность» и мосты в смежные области (есть ChatGPT-режим)
    - **RUN_F.bat**  → двойная оценка: publishability vs breakthrough (есть ChatGPT-режим)
