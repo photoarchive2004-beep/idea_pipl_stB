@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -1223,16 +1224,26 @@ def main() -> int:
                 'notes': '',
             }
             print('\nШаг topic-filter: 1) Вставьте PROMPT_TOPICFILTER.txt в ChatGPT  2) Сохраните JSON в RESPONSE_TOPICFILTER.json\n')
+            copied_topic = copy_prompt_file_to_clipboard(prompt_topicfilter_path)
             open_prepare_artifacts(c1_chat_dir, prompt_topicfilter_path, resp_topicfilter_path)
-            if response_ready(resp_topicfilter_path):
-                try:
-                    raw_topic = parse_screening_response(resp_topicfilter_path)
-                    allowed_topics = {normalize_text(x[0]).lower() for x in (summary.get('top_primary_topics') or []) if isinstance(x, list) and x}
-                    topic_filters = normalize_topic_filter_response(raw_topic, allowed_topics, logger)
-                except Exception as exc:
-                    logger.warn(f'Topic-filter ответ невалиден, продолжаю без topic-filter: {exc}')
-            else:
-                logger.warn('Topic-filter не применён, качество может быть хуже.')
+            if copied_topic:
+                print('PROMPT_TOPICFILTER скопирован в буфер обмена.')
+            # Ждём ответ Topic-filter (как и основной screening), чтобы не продолжать "вслепую"
+            if not wait_for_response(
+                resp_topicfilter_path,
+                logger,
+                timeout_sec=3600,
+                phase_label='[2/7] topic drift detector',
+                response_label='RESPONSE_TOPICFILTER.json',
+            ):
+                return 2
+
+            try:
+                raw_topic = parse_screening_response(resp_topicfilter_path)
+                allowed_topics = {normalize_text(x[0]).lower() for x in (summary.get('top_primary_topics') or []) if isinstance(x, list) and x}
+                topic_filters = normalize_topic_filter_response(raw_topic, allowed_topics, logger)
+            except Exception as exc:
+                logger.warn(f'Topic-filter ответ невалиден, продолжаю без topic-filter: {exc}')
 
             logger.info('[3/7] apply topic filters')
             filtered_candidates, topic_stats = apply_topic_filters(candidates, topic_filters, logger)
@@ -1486,9 +1497,18 @@ def main() -> int:
         return 0
 
     except Exception as exc:
+        # Понятная диагностика: сообщение в консоль + полный traceback в лог
         logger.err(f'Критическая ошибка Stage C1: {exc}')
+        tb = traceback.format_exc()
+        logger.err(tb)
+        print(f"\nОШИБКА Stage C1: {exc}\nСмотри лог: {last_log}\n")
+        # Пишем минимальную ошибку в errors.csv (коротко), а полный traceback остаётся в moduleC1_LAST.log
         if not (manifests_dir / 'errors.csv').exists():
-            write_csv(manifests_dir / 'errors.csv', [{'paper_id': '', 'step': 'fatal', 'url': '', 'http_code': '', 'message': str(exc), 'doi': '', 'openalex_id': ''}], ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'])
+            write_csv(
+                manifests_dir / 'errors.csv',
+                [{'paper_id': '', 'step': 'fatal', 'url': '', 'http_code': '', 'message': str(exc), 'doi': '', 'openalex_id': ''}],
+                ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'],
+            )
         return 1
     finally:
         try:
