@@ -76,7 +76,7 @@
 
 ---
 
-## Stage C — Evidence Table Engine
+## Stage C — Evidence Table Engine (C1/C2/C3)
 **Цель:** из корпуса Stage B собрать кандидаты «claim ↔ source» и составить evidence-таблицу.
 
 **Вход:**
@@ -84,16 +84,20 @@
 - `out\corpus.csv` (B)
 
 **Выход (в `out\`):**
-- `evidence_table.csv` — таблица: claim_id, source_id, relation, certainty и т.д.
-- `evidence_summary.md` — краткое резюме
-- (вспомогательное) `llm_prompt_C.txt` — PROMPT для ChatGPT
-
+- `evidence_table.csv` — нормализованная таблица доказательств
+- `evidence_table.md` — человекочитаемая таблица по claim_id
+- `evidence_summary.md` — агрегаты + QC
+- `evidence_bundle.json` — стабильный экспорт для Stage D
+- `module_C3.log`, `_moduleC3_checkpoint.json`
 **Как запускать:**
-- `RUN_C.bat`
-- `RUN_C.bat "ideas\IDEA-..."`
+- `RUN_C3.bat` (новый launcher)
+- `RUN_C.bat` (совместимость: проксирует в C3)
+- `RUN_C3.bat "ideas\IDEA-..."`
 
-**LLM:** обычно да (2 запуска). Можно без LLM (грубее):
-- `.venv\Scripts\python.exe tools\c_evidence_engine.py --idea "ideas\IDEA-..." --no-llm`
+**UX с ChatGPT (2 запуска):**
+1) Первый запуск создаёт `in\c3_chatgpt\PROMPT.txt` и `README_WHAT_TO_DO.txt`, возвращает ExitCode=2.
+2) Вставьте JSON ответ в `in\c3_chatgpt\RESPONSE.json`.
+3) Повторный запуск автоматически продолжает и строит итоговые файлы.
 
 ---
 
