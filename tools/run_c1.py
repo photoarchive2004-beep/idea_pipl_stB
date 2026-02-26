@@ -16,6 +16,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 import requests
 
@@ -207,6 +208,13 @@ def write_csv(path: Path, rows: List[Dict[str, Any]], columns: List[str]) -> Non
         w.writeheader()
         for r in rows:
             w.writerow({c: r.get(c, "") for c in columns})
+
+
+def host_from_url(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except Exception:
+        return ""
 
 
 def copy_to_clipboard(text: str) -> bool:
@@ -424,27 +432,42 @@ def _short_structured_idea(structured: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def build_topic_domain_summary(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    domain_counter = Counter(normalize_text(c.get("domain", "")).lower() for c in candidates if normalize_text(c.get("domain", "")))
+    field_counter = Counter(normalize_text(c.get("field", "")).lower() for c in candidates if normalize_text(c.get("field", "")))
+    venue_counter = Counter(normalize_text(c.get("venue", "")).lower() for c in candidates if normalize_text(c.get("venue", "")))
+    short_titles = [normalize_text(c.get("title", ""))[:140] for c in candidates[:25] if normalize_text(c.get("title", ""))]
+    return {
+        "n_candidates": len(candidates),
+        "top_domains": domain_counter.most_common(12),
+        "top_fields": field_counter.most_common(12),
+        "top_venues": venue_counter.most_common(15),
+        "sample_titles": short_titles,
+    }
+
+
 def generate_light_screening_prompt(idea_text: str, structured: Dict[str, Any], candidates: List[Dict[str, Any]], max_abs: int, max_pdf: int) -> str:
     """Build a SHORT prompt for ChatGPT to return FILTER RULES (not a list of paper_ids).
 
     Key goal: force VALID JSON (no markdown, no extra quotes like ""GEA Group"", no trailing commas).
     """
-    domain_counter = Counter(normalize_text(c.get("domain", "")).lower() for c in candidates if normalize_text(c.get("domain", "")))
-    field_counter = Counter(normalize_text(c.get("field", "")).lower() for c in candidates if normalize_text(c.get("field", "")))
+    summary = build_topic_domain_summary(candidates)
 
     payload = {
         "idea_text": normalize_text(idea_text)[:4000],
         "structured_idea_short": _short_structured_idea(structured),
         "candidates_stats": {
             "total_candidates": len(candidates),
-            "top_domains": domain_counter.most_common(10),
-            "top_fields": field_counter.most_common(10),
+            "top_domains": summary.get("top_domains", []),
+            "top_fields": summary.get("top_fields", []),
+            "top_venues": summary.get("top_venues", []),
         },
         "required_response_contract": {
             "include_keywords": ["<5-20 ключевых фраз>"],
             "exclude_keywords": ["<5-30 исключающих фраз (омонимы/чужие домены)>"],
             "allowed_domains": [],
             "blocked_domains": [],
+            "ambiguous_abbreviations": [],
             "target_abstracts": max_abs,
             "target_pdfs": max_pdf,
             "notes": ""
@@ -530,6 +553,7 @@ def apply_light_screening(data: Dict[str, Any], candidates: List[Dict[str, Any]]
     exclude = [normalize_text(str(x)).lower() for x in (data.get("exclude_keywords") or []) if normalize_text(str(x))]
     allowed_domains = {normalize_text(str(x)).lower() for x in (data.get("allowed_domains") or []) if normalize_text(str(x))}
     blocked_domains = {normalize_text(str(x)).lower() for x in (data.get("blocked_domains") or []) if normalize_text(str(x))}
+    ambiguous = {normalize_text(str(x)).lower() for x in (data.get("ambiguous_abbreviations") or []) if normalize_text(str(x))}
     if len(include) < 1:
         errors.append("include_keywords пустой.")
     target_abs = max(1, min(max_abs, to_int(data.get("target_abstracts", max_abs), max_abs)))
@@ -541,32 +565,35 @@ def apply_light_screening(data: Dict[str, Any], candidates: List[Dict[str, Any]]
         domain = normalize_text(c.get("domain", "")).lower()
         if allowed_domains and domain and domain not in allowed_domains:
             continue
-        if domain and domain in blocked_domains:
+        if any(b in domain for b in blocked_domains):
+            continue
+        if any(kw in text for kw in ambiguous):
+            continue
+        if any(kw in text for kw in exclude):
             continue
         score = 0.0
         for kw in include:
             if kw and kw in text:
-                score += 2.0
-                score += 0.2 * text.count(kw)
-        excluded = False
-        for kw in exclude:
-            if kw and kw in text:
-                score -= 4.0
-                excluded = True
-        if excluded and score < 0:
-            continue
+                score += 2.0 + (0.2 * text.count(kw))
         score += 1.5 * c.get("domain_match_score", 0)
         c2 = dict(c)
         c2["relevance_score"] = round(score, 4)
         scored.append(c2)
+
     scored.sort(key=lambda x: (-to_float(x.get("relevance_score", 0.0)), -to_float(x.get("score", 0.0)), -to_int(x.get("cited_by", 0)), x.get("paper_id", "")))
     selected: List[Dict[str, Any]] = []
     for i, c in enumerate(scored):
         a = 1 if i < target_abs else 0
-        p = 1 if i < target_pdf else 0
-        if p and c.get("downloadability_hint") not in ("HIGH", "MED"):
-            p = 0
-        selected.append({**c, "select_for_abstract": a, "select_for_pdf": p, "tier": "support", "reason": "light-screening"})
+        selected.append({**c, "select_for_abstract": a, "select_for_pdf": 0, "tier": "support", "reason": "light-screening"})
+
+    pdf_candidates = [x for x in selected if int(x.get("select_for_abstract", 0)) == 1 and x.get("downloadability_hint") in ("HIGH", "MED")]
+    pdf_target_effective = min(target_pdf, len(pdf_candidates))
+    for i, item in enumerate(pdf_candidates):
+        if i >= pdf_target_effective:
+            break
+        item["select_for_pdf"] = 1
+    if pdf_target_effective < target_pdf:
+        errors.append(f"PDF-кандидатов HIGH/MED меньше цели: {pdf_target_effective} < {target_pdf}")
     return selected, errors
 
 
@@ -677,10 +704,71 @@ def fetch_unpaywall_pdf_urls(doi: str, up: ApiClient, email: str) -> Tuple[List[
     return uniq, u
 
 
+
+
+def fetch_crossref_pdf_urls(doi: str, cr: ApiClient, mailto: str) -> Tuple[List[str], str]:
+    h = {"User-Agent": f"IDEA_PIPELINE_C1/1.0 (mailto:{mailto})"}
+    u = f"{CROSSREF_BASE}/{requests.utils.quote(doi, safe='')}?mailto={requests.utils.quote(mailto)}"
+    j = cr.get_json(u, headers=h)
+    urls: List[str] = []
+    for link in (j.get("message") or {}).get("link") or []:
+        url = normalize_text(link.get("URL", ""))
+        ctype = normalize_text(link.get("content-type", "")).lower()
+        if url and ("pdf" in url.lower() or "pdf" in ctype):
+            urls.append(url)
+    return urls, u
+
+
+def extract_openalex_pdf_urls(work: Dict[str, Any]) -> List[str]:
+    urls: List[str] = []
+    oa = work.get("open_access") or {}
+    for key in ["oa_url", "any_repository_has_fulltext"]:
+        val = oa.get(key)
+        if isinstance(val, str) and val:
+            urls.append(val)
+    primary = work.get("primary_location") or {}
+    if normalize_text(primary.get("pdf_url", "")):
+        urls.append(primary.get("pdf_url", ""))
+    for loc in work.get("locations") or []:
+        if normalize_text(loc.get("pdf_url", "")):
+            urls.append(loc.get("pdf_url", ""))
+        landing = normalize_text(loc.get("landing_page_url", ""))
+        if landing and "repository" in landing.lower():
+            urls.append(landing)
+    uniq, seen = [], set()
+    for x in urls:
+        xx = normalize_text(x)
+        if xx and xx not in seen:
+            seen.add(xx)
+            uniq.append(xx)
+    return uniq
+
+
+def unpaywall_healthcheck(email: str, timeout_sec: int, logger: RunLogger) -> bool:
+    if not email:
+        logger.warn('Unpaywall отключен: не задан UNPAYWALL_EMAIL.')
+        return False
+    test_url = f"{UNPAYWALL_BASE}/10.1038/nphys1170?email={requests.utils.quote(email)}"
+    try:
+        r = requests.get(test_url, timeout=(5, min(timeout_sec, 10)))
+        if r.status_code >= 500:
+            logger.warn(f'Unpaywall health-check неуспешен (HTTP {r.status_code}), источник отключен.')
+            return False
+        return True
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as exc:
+        logger.warn(f'Unpaywall недоступен ({exc}); продолжаю без него.')
+        return False
+
+
+def build_missing_pdf_cite(first_author: str, year: str, title: str) -> str:
+    author = normalize_text(first_author).split()[0] if normalize_text(first_author) else 'Unknown'
+    yy = normalize_text(year) or 'n/a'
+    t100 = normalize_text(title)[:100]
+    return f"{author}, {yy}, {t100};"
 def classify_pdf_url(url: str) -> str:
     u = (url or "").lower()
-    high_tokens = ["pmc", "pubmedcentral", "arxiv.org", "zenodo.org", "hal.science", "repository", "eprints", "figshare", "osf.io"]
-    low_tokens = ["sciencedirect", "wiley", "oup", "elsevier", "springer", "nature.com", "tandfonline", "linkinghub", "pdfdirect"]
+    high_tokens = ["pmc", "pubmedcentral", "europepmc", "arxiv.org", "zenodo.org", "hal.science", "repository", "eprints", "figshare", "osf.io", "dspace", "github.com"]
+    low_tokens = ["pdfdirect", "wiley", "academic.oup", "elsevier", "tandfonline", "sciencedirect", "springer", "nature.com"]
     if any(t in u for t in high_tokens):
         return "HIGH"
     if any(t in u for t in low_tokens):
@@ -966,6 +1054,7 @@ def main() -> int:
         secrets = load_secrets(root)
         oa = ApiClient('OpenAlex', args.rps_openalex, args.timeout, logger)
         up = ApiClient('Unpaywall', args.rps_unpaywall, args.timeout, logger)
+        unpaywall_enabled = unpaywall_healthcheck(secrets.get('UNPAYWALL_EMAIL', ''), args.timeout, logger)
         cr = ApiClient('Crossref', args.rps_crossref, args.timeout, logger)
         epmc = ApiClient('EuropePMC', args.rps_europepmc, args.timeout, logger)
         s2 = ApiClient('SemanticScholar', args.rps_s2, args.timeout, logger)
@@ -985,6 +1074,7 @@ def main() -> int:
                 c['oa_pdf_candidates'] = sort_pdf_candidates([c.get('oa_pdf_url', '')])[:1]
                 c['downloadability_hint'] = choose_hint(c['oa_pdf_candidates'])
             write_json(candidates_path, candidates)
+            write_json(c1_chat_dir / 'topic_domain_summary.json', build_topic_domain_summary(candidates))
             write_csv(papers_dir / 'preselection_rejected.csv', rejected, ['index', 'title', 'doi', 'openalex_id', 'reason'])
             write_json(checkpoint_path, {'phase': 'PREPARE_DONE', 'stats': stats, 'idea_dir': str(idea_dir), 'ts': ts})
             if args.screening in ('light', 'full'):
@@ -1008,15 +1098,20 @@ def main() -> int:
         if not candidates:
             raise RuntimeError('Не найден candidates.json для HARVEST. Сначала выполните PREPARE.')
         c_map = {c['paper_id']: c for c in candidates}
-        stats = (load_json_if_exists(checkpoint_path, {}).get('stats') or {'corpus_n': 0, 'after_dedup_n': 0, 'after_domain_filter_n': len(candidates)})
+        stats = (load_json_if_exists(checkpoint_path, {}).get('stats') or {'corpus_n': len(candidates), 'after_dedup_n': len(candidates), 'after_domain_filter_n': len(candidates)})
         if args.screening == 'none':
-            selected = [{**c, 'select_for_abstract': 1 if i < args.max_abstracts else 0, 'select_for_pdf': 1 if i < args.max_pdfs else 0, 'tier': 'support', 'reason': 'автовыбор'} for i, c in enumerate(candidates)]
+            selected = [{**c, 'select_for_abstract': 1 if i < args.max_abstracts else 0, 'select_for_pdf': 0, 'tier': 'support', 'reason': 'автовыбор'} for i, c in enumerate(candidates)]
+            pdf_pool = [x for x in selected if int(x.get('select_for_abstract', 0)) == 1 and x.get('downloadability_hint') in ('HIGH', 'MED')]
+            for i, x in enumerate(pdf_pool):
+                if i >= args.max_pdfs:
+                    break
+                x['select_for_pdf'] = 1
         elif args.screening == 'light':
             raw = parse_screening_response(resp_path)
             selected, validation_errors = apply_light_screening(raw, candidates, args.max_abstracts, args.max_pdfs)
             if validation_errors:
-                write_json(c1_chat_dir / 'RESPONSE.INVALID.json', {'errors': validation_errors, 'response': raw})
-                raise RuntimeError('RESPONSE.json (LIGHT) не прошел валидацию; см. RESPONSE.INVALID.json')
+                write_json(c1_chat_dir / 'RESPONSE.WARNINGS.json', {'warnings': validation_errors, 'response': raw})
+                logger.warn('LIGHT screening: есть предупреждения, продолжаю. См. RESPONSE.WARNINGS.json')
         else:
             raw = parse_screening_response(resp_path)
             selected, validation_errors = validate_full_screening_response(raw, candidates, args.max_abstracts, args.max_pdfs)
@@ -1025,26 +1120,42 @@ def main() -> int:
                 raise RuntimeError('RESPONSE.json не прошел валидацию; см. RESPONSE.INVALID.json')
         selected_abs = [x for x in selected if int(x.get('select_for_abstract', 0)) == 1]
         selected_pdf = [x for x in selected if int(x.get('select_for_pdf', 0)) == 1]
-        logger.info(f'[3/6] Обогащение OA-линками (best-effort) для топ PDF-кандидатов: {min(len(selected_pdf), 80)}')
-        for item in selected_pdf[:80]:
+        logger.info(f'[3/6] Обогащение OA-линками (OpenAlex→EuropePMC→S2→Crossref→Unpaywall) для топ PDF-кандидатов: {min(len(selected_pdf), 120)}')
+        for item in selected_pdf[:120]:
             urls = list(item.get('oa_pdf_candidates', []))
-            if item.get('doi') and secrets.get('UNPAYWALL_EMAIL'):
-                try:
-                    xs, _ = fetch_unpaywall_pdf_urls(item['doi'], up, secrets['UNPAYWALL_EMAIL'])
-                    urls.extend(xs)
-                except Exception as exc:
-                    error_rows.append({'paper_id': item['paper_id'], 'step': 'unpaywall_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+            try:
+                work, _ = get_openalex_work(item, oa, secrets)
+                if work:
+                    urls.extend(extract_openalex_pdf_urls(work))
+            except Exception as exc:
+                error_rows.append({'paper_id': item['paper_id'], 'step': 'openalex_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
             if item.get('pmid'):
                 try:
                     xs, _ = fetch_europepmc_pdf_urls(item['pmid'], epmc)
                     urls.extend(xs)
                 except Exception as exc:
                     error_rows.append({'paper_id': item['paper_id'], 'step': 'europepmc_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
-            if not urls and (item.get('doi') or item.get('title')):
+            if item.get('doi') or item.get('title'):
                 s2u, _ = fetch_semantic_scholar_pdf_url(item.get('doi', ''), item.get('title', ''), s2, secrets.get('S2_API_KEY', ''))
                 if s2u:
                     urls.append(s2u)
-            item['oa_pdf_candidates'] = sort_pdf_candidates(urls)[:5]
+            if item.get('doi') and secrets.get('CROSSREF_MAILTO'):
+                try:
+                    xs, _ = fetch_crossref_pdf_urls(item['doi'], cr, secrets['CROSSREF_MAILTO'])
+                    urls.extend(xs)
+                except Exception as exc:
+                    error_rows.append({'paper_id': item['paper_id'], 'step': 'crossref_pdf_enrich', 'url': '', 'http_code': '', 'message': str(exc), 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+            if item.get('doi') and unpaywall_enabled:
+                try:
+                    xs, _ = fetch_unpaywall_pdf_urls(item['doi'], up, secrets.get('UNPAYWALL_EMAIL', ''))
+                    urls.extend(xs)
+                except Exception as exc:
+                    err_text = str(exc)
+                    if any(k in err_text.lower() for k in ['name or service not known', 'temporary failure in name resolution', 'timed out', 'remotedisconnected']):
+                        unpaywall_enabled = False
+                        logger.warn('Unpaywall отключен после первой сетевой ошибки; продолжаю без него.')
+                    error_rows.append({'paper_id': item['paper_id'], 'step': 'unpaywall_enrich', 'url': '', 'http_code': '', 'message': err_text, 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
+            item['oa_pdf_candidates'] = sort_pdf_candidates(urls)[:7]
             item['downloadability_hint'] = choose_hint(item['oa_pdf_candidates'])
         write_csv(papers_dir / 'selection.csv', selected, ['paper_id', 'title', 'year', 'doi', 'openalex_id', 'first_author', 'tier', 'downloadability_hint', 'select_for_abstract', 'select_for_pdf', 'reason', 'domain', 'field', 'subfield'])
         write_jsonl(papers_dir / 'papers.jsonl', selected)
@@ -1107,6 +1218,8 @@ def main() -> int:
                     q['status'] = 'FOUND_MANUAL'
 
         pdf_ok = 0
+        runtime_blocklist: set = set()
+        host_fail_counter: Counter[str] = Counter()
         logger.info('[6/6] Качаю PDF')
         for i, item in enumerate(selected_pdf, start=1):
             pid = item['paper_id']
@@ -1120,13 +1233,21 @@ def main() -> int:
             urls = sort_pdf_candidates(list(item.get('oa_pdf_candidates', [])))
             tried, got_pdf = [], False
             for u in urls:
+                host = host_from_url(u)
+                if host and host in runtime_blocklist:
+                    manifest_rows.append({'paper_id': pid, 'step': 'download_pdf', 'status': 'skipped', 'source': classify_pdf_url(u), 'url': u, 'http_code': '', 'content_type': '', 'reason': f'host_runtime_blocklist:{host}'})
+                    continue
                 tried.append(u)
                 ok, msg, code, ctype = download_pdf(u, pdf_path, args.timeout)
-                manifest_rows.append({'paper_id': pid, 'step': 'download_pdf', 'status': 'ok' if ok else 'failed', 'source': classify_pdf_url(u), 'url': u, 'http_code': code, 'content_type': ctype})
+                manifest_rows.append({'paper_id': pid, 'step': 'download_pdf', 'status': 'ok' if ok else 'failed', 'source': classify_pdf_url(u), 'url': u, 'http_code': code, 'content_type': ctype, 'reason': msg if not ok else ''})
                 if ok:
                     got_pdf = True
                     pdf_ok += 1
                     break
+                if host and (str(code) in ('401', '403') or 'html' in (ctype or '').lower() or 'не начинается с %pdf' in msg.lower()):
+                    host_fail_counter[host] += 1
+                    if host_fail_counter[host] >= 2:
+                        runtime_blocklist.add(host)
                 error_rows.append({'paper_id': pid, 'step': 'download_pdf', 'url': u, 'http_code': code, 'message': msg, 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
             if not got_pdf:
                 reason_counter['NO_OA_PDF'] += 1
@@ -1146,13 +1267,27 @@ def main() -> int:
                 manual_map[pid]['status'] = 'DOWNLOADED_OK'
 
         write_csv(manual_queue_path, list(manual_map.values()), ['cite_short', 'paper_id', 'doi', 'title', 'year', 'first_author', 'tried_urls', 'manual_pdf_local_path', 'status', 'notes'])
+        missing_rows: List[Dict[str, Any]] = []
+        for row in manual_map.values():
+            if (row.get('status') or '') != 'MISSING':
+                continue
+            missing_rows.append({
+                'missing_citation': build_missing_pdf_cite(row.get('first_author', ''), row.get('year', ''), row.get('title', '')),
+                'paper_id': row.get('paper_id', ''),
+                'doi': row.get('doi', ''),
+                'tried_urls': row.get('tried_urls', ''),
+                'reason': row.get('notes', ''),
+                'manual_pdf_local_path': row.get('manual_pdf_local_path', ''),
+            })
+        write_csv(papers_dir / 'pdf_missing_list.csv', missing_rows, ['missing_citation', 'paper_id', 'doi', 'tried_urls', 'reason', 'manual_pdf_local_path'])
+        (papers_dir / 'pdf_missing_list.txt').write_text('\n'.join(x['missing_citation'] for x in missing_rows) + ('\n' if missing_rows else ''), encoding='utf-8')
         write_jsonl(manifests_dir / 'manifest.jsonl', manifest_rows)
         write_csv(manifests_dir / 'errors.csv', error_rows, ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'])
 
         status = 'OK' if not error_rows else 'DEGRADED'
         top_txt = '\n'.join([f'- {k}: {v}' for k, v in reason_counter.most_common(5)]) if reason_counter else '- нет'
         (out_dir / 'harvest_report.md').write_text(
-            f"# Stage C1 — Harvest report\n\nСтатус: **{status}**\n\n- selected abstracts: {len(selected_abs)}\n- selected pdfs: {len(selected_pdf)}\n- downloaded abstracts_ok: {abs_ok}\n- downloaded pdfs_ok: {pdf_ok}\n- errors total: {len(error_rows)}\n\n## Top-5 причин\n{top_txt}\n",
+            f"# Stage C1 — Отчёт по сбору\n\nСтатус: **{status}**\n\n- corpus_n: {stats.get('corpus_n', len(candidates))}\n- after_dedup_n: {stats.get('after_dedup_n', len(candidates))}\n- after_domain_filter_n: {stats.get('after_domain_filter_n', len(candidates))}\n- selected_abstracts: {len(selected_abs)}\n- selected_pdfs: {len(selected_pdf)}\n- downloaded_abstracts_ok: {abs_ok}\n- downloaded_pdfs_ok: {pdf_ok}\n- errors_total: {len(error_rows)}\n\n## Top-5 причин\n{top_txt}\n",
             encoding='utf-8',
         )
         (out_dir / 'prisma_c1.md').write_text(
