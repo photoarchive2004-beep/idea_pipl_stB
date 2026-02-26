@@ -340,6 +340,7 @@ def discover_idea_topics(oa: ApiClient, keywords: List[str], secrets: Dict[str, 
 def compute_domain_match(work: Dict[str, Any], idea_topics: Dict[str, set]) -> Tuple[int, Dict[str, str]]:
     pt = work.get("primary_topic") or {}
     wid = normalize_text(pt.get("id", "")).split("/")[-1]
+    topic_name = normalize_text(pt.get("display_name", "")).lower()
     domain = normalize_text((pt.get("domain") or {}).get("display_name", "")).lower()
     field = normalize_text((pt.get("field") or {}).get("display_name", "")).lower()
     subfield = normalize_text((pt.get("subfield") or {}).get("display_name", "")).lower()
@@ -352,7 +353,7 @@ def compute_domain_match(work: Dict[str, Any], idea_topics: Dict[str, set]) -> T
         score += 2
     if subfield and subfield in idea_topics["subfields"]:
         score += 1
-    return score, {"primary_topic_id": wid, "domain": domain, "field": field, "subfield": subfield}
+    return score, {"primary_topic_id": wid, "primary_topic": topic_name, "domain": domain, "field": field, "subfield": subfield}
 
 
 def preclean_corpus(rows: List[Dict[str, str]], oa: ApiClient, secrets: Dict[str, str], keywords: List[str], logger: RunLogger, max_candidates: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]:
@@ -395,7 +396,7 @@ def preclean_corpus(rows: List[Dict[str, str]], oa: ApiClient, secrets: Dict[str
             "source_row": r,
         }
         domain_score = 1
-        topic_info = {"primary_topic_id": "", "domain": "", "field": "", "subfield": ""}
+        topic_info = {"primary_topic_id": "", "primary_topic": "", "domain": "", "field": "", "subfield": ""}
         if idea_topics["topic_ids"] or idea_topics["domains"] or idea_topics["fields"] or idea_topics["subfields"]:
             work, _ = get_openalex_work(r, oa, secrets)
             if work:
@@ -433,16 +434,120 @@ def _short_structured_idea(structured: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_topic_domain_summary(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    topic_counter = Counter(normalize_text(c.get("primary_topic", "")).lower() for c in candidates if normalize_text(c.get("primary_topic", "")))
     domain_counter = Counter(normalize_text(c.get("domain", "")).lower() for c in candidates if normalize_text(c.get("domain", "")))
     field_counter = Counter(normalize_text(c.get("field", "")).lower() for c in candidates if normalize_text(c.get("field", "")))
     venue_counter = Counter(normalize_text(c.get("venue", "")).lower() for c in candidates if normalize_text(c.get("venue", "")))
     short_titles = [normalize_text(c.get("title", ""))[:140] for c in candidates[:25] if normalize_text(c.get("title", ""))]
     return {
         "n_candidates": len(candidates),
+        "top_primary_topics": topic_counter.most_common(20),
         "top_domains": domain_counter.most_common(12),
         "top_fields": field_counter.most_common(12),
         "top_venues": venue_counter.most_common(15),
         "sample_titles": short_titles,
+    }
+
+
+def generate_topic_filter_prompt(idea_text: str, structured: Dict[str, Any], summary: Dict[str, Any], stats: Dict[str, int]) -> str:
+    payload = {
+        "idea_text": normalize_text(idea_text)[:3000],
+        "structured_idea_short": _short_structured_idea(structured),
+        "corpus_stats": {
+            "N_corpus": stats.get("corpus_n", 0),
+            "N_after_dedup": stats.get("after_dedup_n", 0),
+            "N_after_domain_filter": stats.get("after_domain_filter_n", 0),
+        },
+        "top_primary_topics": summary.get("top_primary_topics", [])[:20],
+        "top_domains": summary.get("top_domains", [])[:10],
+        "top_fields": summary.get("top_fields", [])[:10],
+        "required_response_contract": {
+            "blocked_topics": ["<точные названия тем из top_primary_topics>"],
+            "blocked_domains": ["<научные домены/области>", "<без URL>"] ,
+            "exclude_keywords": ["<омонимы/чужие значения>"],
+            "include_keywords": ["<уточняющие ключи идеи>"],
+            "ambiguous_abbreviations": ["<двусмысленные аббревиатуры>"],
+            "notes": ""
+        },
+        "rules": [
+            "ВЕРНИ ТОЛЬКО ВАЛИДНЫЙ JSON. Без markdown и без текста до/после JSON.",
+            "Используй только обычные двойные кавычки \"\".",
+            "Без trailing commas.",
+            "blocked_topics выбирай ТОЛЬКО из top_primary_topics. Любые другие значения будут проигнорированы.",
+            "blocked_domains: только научные домены/области, не домены сайтов и не URL.",
+            "Никаких списков статей и paper_id: только правила фильтрации."
+        ]
+    }
+    return "TOPIC DRIFT DETECTOR C1: верни JSON с правилами topic-filter.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def normalize_topic_filter_response(raw: Dict[str, Any], allowed_topics: set, logger: RunLogger) -> Dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    blocked_topics: List[str] = []
+    for x in (data.get("blocked_topics") or []):
+        val = normalize_text(str(x))
+        if val and val.lower() in allowed_topics:
+            blocked_topics.append(val)
+
+    exclude_keywords = [normalize_text(str(x)).lower() for x in (data.get("exclude_keywords") or []) if normalize_text(str(x))]
+    include_keywords = [normalize_text(str(x)).lower() for x in (data.get("include_keywords") or []) if normalize_text(str(x))]
+    ambiguous = [normalize_text(str(x)).lower() for x in (data.get("ambiguous_abbreviations") or []) if normalize_text(str(x))]
+    blocked_domains_raw = [normalize_text(str(x)).lower() for x in (data.get("blocked_domains") or []) if normalize_text(str(x))]
+    blocked_domains: List[str] = []
+    moved_sites: List[str] = []
+    for x in blocked_domains_raw:
+        if "." in x or "/" in x:
+            moved_sites.append(x)
+        else:
+            blocked_domains.append(x)
+    if moved_sites:
+        logger.warn("[WARN] blocked_domains содержит домены сайтов → перенёс в exclude_keywords")
+        exclude_keywords.extend(moved_sites)
+
+    dedup = lambda arr: list(dict.fromkeys(arr))
+    return {
+        "blocked_topics": dedup(blocked_topics),
+        "blocked_domains": dedup(blocked_domains),
+        "exclude_keywords": dedup(exclude_keywords),
+        "include_keywords": dedup(include_keywords),
+        "ambiguous_abbreviations": dedup(ambiguous),
+        "notes": normalize_text(str(data.get("notes", ""))),
+    }
+
+
+def apply_topic_filters(candidates: List[Dict[str, Any]], filters: Dict[str, Any], logger: RunLogger) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    blocked_topics = {normalize_text(x).lower() for x in (filters.get("blocked_topics") or []) if normalize_text(x)}
+    blocked_domains = {normalize_text(x).lower() for x in (filters.get("blocked_domains") or []) if normalize_text(x)}
+    exclude_keywords = [normalize_text(x).lower() for x in (filters.get("exclude_keywords") or []) if normalize_text(x)]
+    include_keywords = [normalize_text(x).lower() for x in (filters.get("include_keywords") or []) if normalize_text(x)]
+    ambiguous = [normalize_text(x).lower() for x in (filters.get("ambiguous_abbreviations") or []) if normalize_text(x)]
+
+    n0 = len(candidates)
+    s1 = [c for c in candidates if normalize_text(c.get("primary_topic", "")).lower() not in blocked_topics]
+    s2 = [c for c in s1 if normalize_text(c.get("domain", "")).lower() not in blocked_domains]
+
+    s3 = []
+    for c in s2:
+        text = normalize_text(" ".join([c.get("title", ""), c.get("abstract_snippet", "")])).lower()
+        if any(kw in text for kw in ambiguous):
+            continue
+        if any(kw in text for kw in exclude_keywords):
+            continue
+        if include_keywords and not any(kw in text for kw in include_keywords):
+            continue
+        hits = sum(text.count(kw) for kw in include_keywords if kw)
+        c2 = dict(c)
+        c2["topicfilter_include_hits"] = hits
+        s3.append(c2)
+
+    logger.info(f"Topic-filter: после blocked_topics = {len(s1)} / {n0}")
+    logger.info(f"Topic-filter: после blocked_domains = {len(s2)} / {n0}")
+    logger.info(f"Topic-filter: после keyword-фильтров = {len(s3)} / {n0}")
+    return s3, {
+        "before_topic_filter_n": n0,
+        "after_blocked_topics_n": len(s1),
+        "after_blocked_domains_n": len(s2),
+        "after_topic_filter_n": len(s3),
     }
 
 
@@ -553,6 +658,10 @@ def apply_light_screening(data: Dict[str, Any], candidates: List[Dict[str, Any]]
     exclude = [normalize_text(str(x)).lower() for x in (data.get("exclude_keywords") or []) if normalize_text(str(x))]
     allowed_domains = {normalize_text(str(x)).lower() for x in (data.get("allowed_domains") or []) if normalize_text(str(x))}
     blocked_domains = {normalize_text(str(x)).lower() for x in (data.get("blocked_domains") or []) if normalize_text(str(x))}
+    site_like = {x for x in blocked_domains if '.' in x or '/' in x}
+    if site_like:
+        blocked_domains = {x for x in blocked_domains if x not in site_like}
+        exclude.extend(sorted(site_like))
     ambiguous = {normalize_text(str(x)).lower() for x in (data.get("ambiguous_abbreviations") or []) if normalize_text(str(x))}
     if len(include) < 1:
         errors.append("include_keywords пустой.")
@@ -565,7 +674,7 @@ def apply_light_screening(data: Dict[str, Any], candidates: List[Dict[str, Any]]
         domain = normalize_text(c.get("domain", "")).lower()
         if allowed_domains and domain and domain not in allowed_domains:
             continue
-        if any(b in domain for b in blocked_domains):
+        if domain in blocked_domains:
             continue
         if any(kw in text for kw in ambiguous):
             continue
@@ -755,7 +864,7 @@ def unpaywall_healthcheck(email: str, timeout_sec: int, logger: RunLogger) -> bo
             logger.warn(f'Unpaywall health-check неуспешен (HTTP {r.status_code}), источник отключен.')
             return False
         return True
-    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as exc:
+    except Exception as exc:
         logger.warn(f'Unpaywall недоступен ({exc}); продолжаю без него.')
         return False
 
@@ -765,6 +874,26 @@ def build_missing_pdf_cite(first_author: str, year: str, title: str) -> str:
     yy = normalize_text(year) or 'n/a'
     t100 = normalize_text(title)[:100]
     return f"{author}, {yy}, {t100};"
+
+
+def tier_priority(tier: str) -> int:
+    val = normalize_text(tier).lower()
+    if val == 'core':
+        return 3
+    if val == 'support':
+        return 2
+    return 1
+
+
+def relevance_sort_tuple(item: Dict[str, Any]) -> Tuple:
+    return (
+        -tier_priority(item.get('tier', '')),
+        -to_float(item.get('relevance_score', 0.0)),
+        -to_int(item.get('topicfilter_include_hits', 0)),
+        -to_float(item.get('score', 0.0)),
+        -to_int(item.get('cited_by', 0)),
+        item.get('paper_id', ''),
+    )
 def classify_pdf_url(url: str) -> str:
     u = (url or "").lower()
     high_tokens = ["pmc", "pubmedcentral", "europepmc", "arxiv.org", "zenodo.org", "hal.science", "repository", "eprints", "figshare", "osf.io", "dspace", "github.com"]
@@ -896,17 +1025,17 @@ def response_ready(resp_path: Path) -> bool:
     return raw not in ('', '{}', '{"selected": []}')
 
 
-def wait_for_response(resp_path: Path, logger: RunLogger, timeout_sec: int = 3600) -> bool:
+def wait_for_response(resp_path: Path, logger: RunLogger, timeout_sec: int = 3600, phase_label: str = '[4/7]', response_label: str = 'RESPONSE.json') -> bool:
     start = time.time()
     last_size = -1
-    logger.info('[4/6] ChatGPT screening: ожидаю RESPONSE.json ...')
+    logger.info(f'{phase_label} Ожидаю {response_label} ...')
     while True:
         try:
             if resp_path.exists():
                 size = resp_path.stat().st_size
                 if size != last_size:
                     last_size = size
-                    logger.info(f'RESPONSE.json обновлен: size={size} байт')
+                    logger.info(f'{response_label} обновлен: size={size} байт')
                 if response_ready(resp_path):
                     try:
                         parse_screening_response(resp_path)
@@ -918,10 +1047,10 @@ def wait_for_response(resp_path: Path, logger: RunLogger, timeout_sec: int = 360
                 logger.warn('Таймаут ожидания ответа ChatGPT.')
                 return False
             if elapsed % 30 == 0:
-                print(f'... Я жду RESPONSE.json ({elapsed} сек)')
+                print(f'... Я жду {response_label} ({elapsed} сек)')
             time.sleep(2)
         except KeyboardInterrupt:
-            logger.warn('Ожидание RESPONSE.json прервано пользователем (Ctrl+C).')
+            logger.warn(f'Ожидание {response_label} прервано пользователем (Ctrl+C).')
             return False
 
 
@@ -1026,6 +1155,8 @@ def main() -> int:
     out_dir, abstracts_dir, pdf_dir = idea_dir / 'out', idea_dir / 'in' / 'papers' / 'abstracts', idea_dir / 'in' / 'papers' / 'pdfs'
     c1_chat_dir = in_dir / 'c1_chatgpt'
     prompt_path, resp_path = c1_chat_dir / 'PROMPT.txt', c1_chat_dir / 'RESPONSE.json'
+    prompt_topicfilter_path = c1_chat_dir / 'PROMPT_TOPICFILTER.txt'
+    resp_topicfilter_path = c1_chat_dir / 'RESPONSE_TOPICFILTER.json'
     candidates_path = papers_dir / 'candidates.json'
     checkpoint_path = out_dir / '_moduleC1_checkpoint.json'
 
@@ -1064,21 +1195,58 @@ def main() -> int:
             if not corpus_path.exists():
                 raise FileNotFoundError(f'Не найден обязательный файл: {corpus_path}')
             rows = load_corpus(corpus_path)
-            logger.info(f'[1/6] Читаю corpus.csv (N={len(rows)})')
+            logger.info(f'[1/7] corpus summary: читаю corpus.csv (N={len(rows)})')
             idea_text, structured, keywords = extract_idea_context(idea_dir)
             candidates, rejected, stats = preclean_corpus(rows, oa, secrets, keywords, logger, args.max_candidates)
             stats['corpus_n'] = len(rows)
-            logger.info(f"[2/6] Дедуп/фильтры => осталось {len(candidates)}")
-            logger.info('[3/6] Готовлю candidates.json и PROMPT')
+            logger.info(f"[1/7] corpus summary: после дедуп/базовых фильтров осталось {len(candidates)}")
+            logger.info('[2/7] topic drift detector: готовлю сводку и PROMPT_TOPICFILTER')
             for c in candidates:
                 c['oa_pdf_candidates'] = sort_pdf_candidates([c.get('oa_pdf_url', '')])[:1]
                 c['downloadability_hint'] = choose_hint(c['oa_pdf_candidates'])
-            write_json(candidates_path, candidates)
-            write_json(c1_chat_dir / 'topic_domain_summary.json', build_topic_domain_summary(candidates))
+            summary = build_topic_domain_summary(candidates)
+            write_json(c1_chat_dir / 'topic_domain_summary.json', summary)
             write_csv(papers_dir / 'preselection_rejected.csv', rejected, ['index', 'title', 'doi', 'openalex_id', 'reason'])
+
+            c1_chat_dir.mkdir(parents=True, exist_ok=True)
+            topic_prompt = generate_topic_filter_prompt(idea_text, structured, summary, stats)
+            prompt_topicfilter_path.write_text(topic_prompt, encoding='utf-8')
+            if not resp_topicfilter_path.exists():
+                resp_topicfilter_path.write_text('{}\n', encoding='utf-8')
+
+            topic_filters: Dict[str, Any] = {
+                'blocked_topics': [],
+                'blocked_domains': [],
+                'exclude_keywords': [],
+                'include_keywords': [],
+                'ambiguous_abbreviations': [],
+                'notes': '',
+            }
+            print('\nШаг topic-filter: 1) Вставьте PROMPT_TOPICFILTER.txt в ChatGPT  2) Сохраните JSON в RESPONSE_TOPICFILTER.json\n')
+            open_prepare_artifacts(c1_chat_dir, prompt_topicfilter_path, resp_topicfilter_path)
+            if response_ready(resp_topicfilter_path):
+                try:
+                    raw_topic = parse_screening_response(resp_topicfilter_path)
+                    allowed_topics = {normalize_text(x[0]).lower() for x in (summary.get('top_primary_topics') or []) if isinstance(x, list) and x}
+                    topic_filters = normalize_topic_filter_response(raw_topic, allowed_topics, logger)
+                except Exception as exc:
+                    logger.warn(f'Topic-filter ответ невалиден, продолжаю без topic-filter: {exc}')
+            else:
+                logger.warn('Topic-filter не применён, качество может быть хуже.')
+
+            logger.info('[3/7] apply topic filters')
+            filtered_candidates, topic_stats = apply_topic_filters(candidates, topic_filters, logger)
+            if not filtered_candidates:
+                logger.warn('Topic-filter отфильтровал всё; продолжаю с исходными кандидатами.')
+                filtered_candidates = candidates
+            candidates = filtered_candidates
+            stats.update(topic_stats)
+            stats['after_topic_filter_n'] = len(candidates)
+            write_json(c1_chat_dir / 'topic_filter_applied.json', {'filters': topic_filters, 'stats': topic_stats})
+
+            write_json(candidates_path, candidates)
             write_json(checkpoint_path, {'phase': 'PREPARE_DONE', 'stats': stats, 'idea_dir': str(idea_dir), 'ts': ts})
             if args.screening in ('light', 'full'):
-                c1_chat_dir.mkdir(parents=True, exist_ok=True)
                 prompt = generate_light_screening_prompt(idea_text, structured, candidates, args.max_abstracts, args.max_pdfs) if args.screening == 'light' else generate_full_screening_prompt(idea_text, structured, candidates, args.max_abstracts, args.max_pdfs)
                 prompt_path.write_text(prompt, encoding='utf-8')
                 if not resp_path.exists():
@@ -1086,14 +1254,14 @@ def main() -> int:
                 (c1_chat_dir / 'README_WHAT_TO_DO.txt').write_text('1) Откройте PROMPT.txt и отправьте в ChatGPT.\n2) Вставьте JSON-ответ в RESPONSE.json и сохраните файл.\n3) Скрипт автоматически продолжит работу.\n', encoding='utf-8')
                 copied = copy_prompt_file_to_clipboard(prompt_path)
                 open_prepare_artifacts(c1_chat_dir, prompt_path, resp_path)
-                logger.info(f'[4/6] ChatGPT screening ({args.screening.upper()}): создан PROMPT, ожидаю RESPONSE...')
+                logger.info(f'[4/7] screening/selection ({args.screening.upper()}): создан PROMPT, ожидаю RESPONSE...')
                 print('\nШаги: 1) Вставьте PROMPT в ChatGPT  2) Сохраните JSON в RESPONSE.json  3) Скрипт продолжит сам.\n')
                 if copied:
                     print('PROMPT скопирован в буфер обмена.')
-                if not wait_for_response(resp_path, logger, timeout_sec=3600):
+                if not wait_for_response(resp_path, logger, timeout_sec=3600, phase_label='[4/7] screening/selection', response_label='RESPONSE.json'):
                     return 2
 
-        logger.info('[4/6] HARVEST: использую готовые candidates + RESPONSE')
+        logger.info('[4/7] screening/selection: использую candidates + RESPONSE')
         candidates = load_json_if_exists(candidates_path, [])
         if not candidates:
             raise RuntimeError('Не найден candidates.json для HARVEST. Сначала выполните PREPARE.')
@@ -1119,8 +1287,8 @@ def main() -> int:
                 write_json(c1_chat_dir / 'RESPONSE.INVALID.json', {'errors': validation_errors, 'response': raw})
                 raise RuntimeError('RESPONSE.json не прошел валидацию; см. RESPONSE.INVALID.json')
         selected_abs = [x for x in selected if int(x.get('select_for_abstract', 0)) == 1]
-        selected_pdf = [x for x in selected if int(x.get('select_for_pdf', 0)) == 1]
-        logger.info(f'[3/6] Обогащение OA-линками (OpenAlex→EuropePMC→S2→Crossref→Unpaywall) для топ PDF-кандидатов: {min(len(selected_pdf), 120)}')
+        selected_pdf = sorted([x for x in selected if int(x.get('select_for_pdf', 0)) == 1], key=relevance_sort_tuple)
+        logger.info(f'[6/7] harvest pdf: обогащение OA-линками (OpenAlex→EuropePMC→S2→Crossref→Unpaywall) для топ PDF-кандидатов: {min(len(selected_pdf), 120)}')
         for item in selected_pdf[:120]:
             urls = list(item.get('oa_pdf_candidates', []))
             try:
@@ -1162,7 +1330,7 @@ def main() -> int:
 
         reason_counter: Counter[str] = Counter()
         abs_ok = 0
-        logger.info('[5/6] Качаю абстракты')
+        logger.info('[5/7] harvest abstracts: качаю абстракты')
         for i, item in enumerate(selected_abs, start=1):
             pid = item['paper_id']
             abs_path = abstracts_dir / f'{pid}.txt'
@@ -1220,7 +1388,7 @@ def main() -> int:
         pdf_ok = 0
         runtime_blocklist: set = set()
         host_fail_counter: Counter[str] = Counter()
-        logger.info('[6/6] Качаю PDF')
+        logger.info('[6/7] harvest pdf: качаю PDF')
         for i, item in enumerate(selected_pdf, start=1):
             pid = item['paper_id']
             pdf_path = pdf_dir / f'{pid}.pdf'
@@ -1251,8 +1419,9 @@ def main() -> int:
                 error_rows.append({'paper_id': pid, 'step': 'download_pdf', 'url': u, 'http_code': code, 'message': msg, 'doi': item.get('doi', ''), 'openalex_id': item.get('openalex_id', '')})
             if not got_pdf:
                 reason_counter['NO_OA_PDF'] += 1
+                rank_value = 100000 - (tier_priority(item.get('tier', '')) * 10000 + int(to_float(item.get('relevance_score', 0.0)) * 100) + to_int(item.get('topicfilter_include_hits', 0)) * 10 + to_int(item.get('cited_by', 0)))
                 manual_map[pid] = {
-                    'cite_short': build_cite_short(item.get('first_author', ''), item.get('year', ''), item.get('title', '')),
+                    'cite_short': build_missing_pdf_cite(item.get('first_author', ''), item.get('year', ''), item.get('title', '')),
                     'paper_id': pid,
                     'doi': item.get('doi', ''),
                     'title': item.get('title', ''),
@@ -1262,13 +1431,15 @@ def main() -> int:
                     'manual_pdf_local_path': manual_map.get(pid, {}).get('manual_pdf_local_path', ''),
                     'status': 'MISSING',
                     'notes': '403 publisher' if any(str(e.get('http_code','')) in ('401', '403') for e in error_rows if e.get('paper_id') == pid) else 'no_oa_location',
+                    'relevance_rank': rank_value,
                 }
             elif pid in manual_map:
                 manual_map[pid]['status'] = 'DOWNLOADED_OK'
 
-        write_csv(manual_queue_path, list(manual_map.values()), ['cite_short', 'paper_id', 'doi', 'title', 'year', 'first_author', 'tried_urls', 'manual_pdf_local_path', 'status', 'notes'])
+        manual_rows = sorted(list(manual_map.values()), key=lambda x: to_int(x.get('relevance_rank', 10**9)))
+        write_csv(manual_queue_path, manual_rows, ['cite_short', 'paper_id', 'doi', 'title', 'year', 'first_author', 'tried_urls', 'manual_pdf_local_path', 'status', 'notes', 'relevance_rank'])
         missing_rows: List[Dict[str, Any]] = []
-        for row in manual_map.values():
+        for row in manual_rows:
             if (row.get('status') or '') != 'MISSING':
                 continue
             missing_rows.append({
@@ -1278,9 +1449,11 @@ def main() -> int:
                 'tried_urls': row.get('tried_urls', ''),
                 'reason': row.get('notes', ''),
                 'manual_pdf_local_path': row.get('manual_pdf_local_path', ''),
+                'relevance_rank': row.get('relevance_rank', ''),
             })
-        write_csv(papers_dir / 'pdf_missing_list.csv', missing_rows, ['missing_citation', 'paper_id', 'doi', 'tried_urls', 'reason', 'manual_pdf_local_path'])
+        write_csv(papers_dir / 'pdf_missing_list.csv', missing_rows, ['missing_citation', 'paper_id', 'doi', 'tried_urls', 'reason', 'manual_pdf_local_path', 'relevance_rank'])
         (papers_dir / 'pdf_missing_list.txt').write_text('\n'.join(x['missing_citation'] for x in missing_rows) + ('\n' if missing_rows else ''), encoding='utf-8')
+        logger.info('[7/7] reports + manual list')
         write_jsonl(manifests_dir / 'manifest.jsonl', manifest_rows)
         write_csv(manifests_dir / 'errors.csv', error_rows, ['paper_id', 'step', 'url', 'http_code', 'message', 'doi', 'openalex_id'])
 
